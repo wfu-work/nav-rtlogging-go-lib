@@ -1,5 +1,3 @@
-//go:build integration
-
 package ntrip
 
 import (
@@ -11,7 +9,7 @@ import (
 )
 
 func TestNtripClient(t *testing.T) {
-	ntripClient := NewNtripClientGgaExtra("203.107.45.154", 8003, "AUTO", "qxykhy005741", "7147d20", 32.05330802, 119.61051377, 1929.9857, "")
+	ntripClient := NewNtripClient("ntrip-client.navfirst.com", 9095, "PZHCH01", "PZHCH01", "PZHCH01")
 	ntripClient.OnConnect(func(key string, mountPoint string, conn net.Conn) {
 		fmt.Println("✅ntrip client online: ", key, mountPoint)
 	})

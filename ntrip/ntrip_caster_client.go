@@ -1,18 +1,18 @@
 package ntrip
 
 import (
-	"encoding/base64"
+	"errors"
 	"fmt"
-	"log"
 	"net"
-	"strings"
 	"sync"
+	"time"
 )
 
-// NtripCasterClient 封装结构
+// NtripCasterClient accepts NTRIP subscriber connections.
 type NtripCasterClient struct {
 	addr       string
 	ln         net.Listener
+	listen     func(network, address string) (net.Listener, error)
 	ntripMap   *SafeNtripMap
 	onConnect  OnConnectFunc
 	disConnect OnDisConnectFunc
@@ -21,217 +21,275 @@ type NtripCasterClient struct {
 	onAuth     OnAuthFunc
 	onNetError OnNetErrorFunc
 	done       chan struct{}
-	stopOnce   sync.Once
-	mu         sync.Mutex
+	conns      map[net.Conn]struct{}
+	mu         sync.RWMutex
+	callbackMu sync.RWMutex
 }
 
-// NewNtripCasterClient 创建新 Server 实例
+// NewNtripCasterClient creates the subscriber-facing side of an embedded caster.
 func NewNtripCasterClient(port int) *NtripCasterClient {
+	return NewNtripCasterClientOnAddress("127.0.0.1", port)
+}
+
+// NewNtripCasterClientOnAddress creates a subscriber listener bound to host.
+func NewNtripCasterClientOnAddress(host string, port int) *NtripCasterClient {
 	return &NtripCasterClient{
-		addr:     fmt.Sprintf(":%d", port),
+		addr:     net.JoinHostPort(host, fmt.Sprintf("%d", port)),
+		listen:   net.Listen,
 		ntripMap: NewSafeNtripMap(),
 		done:     make(chan struct{}),
+		conns:    make(map[net.Conn]struct{}),
 	}
 }
 
-// OnConnect 设置连接回调
 func (s *NtripCasterClient) OnConnect(f OnConnectFunc) {
+	s.callbackMu.Lock()
 	s.onConnect = f
+	s.callbackMu.Unlock()
 }
 
-// DisConnect 设置断开回调
 func (s *NtripCasterClient) DisConnect(f OnDisConnectFunc) {
+	s.callbackMu.Lock()
 	s.disConnect = f
+	s.callbackMu.Unlock()
 }
 
-// OnData 设置数据回调
 func (s *NtripCasterClient) OnData(f OnDataFunc) {
+	s.callbackMu.Lock()
 	s.onData = f
+	s.callbackMu.Unlock()
 }
 
-// OnSize 设置数据大小回调
 func (s *NtripCasterClient) OnSize(f OnSizeFunc) {
+	s.callbackMu.Lock()
 	s.onSize = f
+	s.callbackMu.Unlock()
 }
 
-// OnAuth 设置认证回调
 func (s *NtripCasterClient) OnAuth(f OnAuthFunc) {
+	s.callbackMu.Lock()
 	s.onAuth = f
+	s.callbackMu.Unlock()
 }
 
-// NetError 设置网络错误回调
 func (s *NtripCasterClient) NetError(f OnNetErrorFunc) {
+	s.callbackMu.Lock()
 	s.onNetError = f
+	s.callbackMu.Unlock()
 }
 
-// Start 启动服务
+func (s *NtripCasterClient) callbacks() (OnConnectFunc, OnDisConnectFunc, OnDataFunc, OnSizeFunc, OnAuthFunc, OnNetErrorFunc) {
+	s.callbackMu.RLock()
+	defer s.callbackMu.RUnlock()
+	return s.onConnect, s.disConnect, s.onData, s.onSize, s.onAuth, s.onNetError
+}
+
+// Addr returns the active listener address, or nil when stopped.
+func (s *NtripCasterClient) Addr() net.Addr {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.ln == nil {
+		return nil
+	}
+	return s.ln.Addr()
+}
+
+// Start starts accepting subscriber connections. A stopped server may be started again.
 func (s *NtripCasterClient) Start() error {
-	ln, err := net.Listen("tcp", s.addr)
+	s.mu.Lock()
+	if s.ln != nil {
+		s.mu.Unlock()
+		return errors.New("ntrip caster client listener already started")
+	}
+	listen := s.listen
+	if listen == nil {
+		listen = net.Listen
+	}
+	ln, err := listen("tcp", s.addr)
 	if err != nil {
-		log.Println("❌ntrip caster client net error:", err)
-		if s.onNetError != nil {
-			s.onNetError(err)
+		s.mu.Unlock()
+		_, _, _, _, _, onNetError := s.callbacks()
+		if onNetError != nil {
+			onNetError(err)
 		}
 		return err
 	}
-	s.mu.Lock()
+	if s.done == nil || isClosed(s.done) {
+		s.done = make(chan struct{})
+	}
 	s.ln = ln
+	done := s.done
 	s.mu.Unlock()
-	log.Println("✅ntrip caster client listening on", s.addr)
+	logPrintln("✅ntrip caster client listening on", ln.Addr())
 
-	go func() {
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				select {
-				case <-s.done:
-					return
-				default:
-				}
-				log.Println("❌ntrip caster client accept error:", err)
-				continue
-			}
-			go s.handleConn(conn)
-		}
-	}()
+	go s.acceptLoop(ln, done)
 	return nil
 }
 
-func (s *NtripCasterClient) Stop() error {
-	var err error
-	s.stopOnce.Do(func() {
-		close(s.done)
-		s.ntripMap.CloseAll()
-		s.mu.Lock()
-		if s.ln != nil {
-			err = s.ln.Close()
-			s.ln = nil
+func (s *NtripCasterClient) acceptLoop(ln net.Listener, done <-chan struct{}) {
+	var retryDelay time.Duration
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			if isClosed(done) || errors.Is(err, net.ErrClosed) {
+				return
+			}
+			_, _, _, _, _, onNetError := s.callbacks()
+			if onNetError != nil {
+				onNetError(err)
+			}
+			if retryDelay == 0 {
+				retryDelay = 5 * time.Millisecond
+			} else {
+				retryDelay *= 2
+				if retryDelay > time.Second {
+					retryDelay = time.Second
+				}
+			}
+			timer := time.NewTimer(retryDelay)
+			select {
+			case <-done:
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			continue
 		}
+		retryDelay = 0
+		s.mu.Lock()
+		if s.ln != ln {
+			s.mu.Unlock()
+			_ = conn.Close()
+			continue
+		}
+		s.conns[conn] = struct{}{}
 		s.mu.Unlock()
-	})
+		go s.handleConn(conn)
+	}
+}
+
+// Stop closes the listener and every authenticated or pending connection.
+func (s *NtripCasterClient) Stop() error {
+	s.mu.Lock()
+	ln := s.ln
+	s.ln = nil
+	if s.done != nil && !isClosed(s.done) {
+		close(s.done)
+	}
+	conns := make([]net.Conn, 0, len(s.conns))
+	for conn := range s.conns {
+		conns = append(conns, conn)
+	}
+	s.conns = make(map[net.Conn]struct{})
+	s.mu.Unlock()
+
+	s.ntripMap.CloseAll()
+	var err error
+	if ln != nil {
+		err = ln.Close()
+	}
+	for _, conn := range conns {
+		_ = conn.Close()
+	}
 	return err
 }
 
-// handleConn 处理每个连接
 func (s *NtripCasterClient) handleConn(conn net.Conn) {
 	enableTCPKeepAlive(conn)
 	key := conn.RemoteAddr().String()
+	var bean *NtripChannelBean
 	defer func() {
-		ntripChannelVo := s.ntripMap.Delete(key)
-		if ntripChannelVo != nil {
-			if s.disConnect != nil {
-				s.disConnect(key, ntripChannelVo.mount)
+		s.mu.Lock()
+		delete(s.conns, conn)
+		s.mu.Unlock()
+		removed := s.ntripMap.Delete(key)
+		if removed != nil {
+			_, onDisconnect, _, _, _, _ := s.callbacks()
+			if onDisconnect != nil {
+				onDisconnect(key, removed.mount)
 			}
-			ntripChannelVo.Close()
-			log.Printf("❌ntrip caster client disconnect from: %s - %s", conn.RemoteAddr(), ntripChannelVo.mount)
-			return
+			removed.Close()
+			logPrintf("ntrip caster client disconnected: %s - %s", key, removed.mount)
+		} else {
+			_ = conn.Close()
 		}
-		_ = conn.Close()
 	}()
 
-	authenticated := false
 	buf := make([]byte, defaultNtripReadBufferSize)
+	authBuf := make([]byte, 0, 512)
 	for {
-		if !authenticated {
+		if bean == nil {
 			setReadDeadline(conn, defaultNtripAuthTimeout)
 		}
 		n, err := conn.Read(buf)
 		if err != nil {
-			log.Println("❌ntrip caster client read error: ", err)
-			break
+			if !errors.Is(err, net.ErrClosed) {
+				logPrintf("ntrip caster client read error from %s: %v", key, err)
+			}
+			return
 		}
-		bytes := buf[:n]
-		ntripChannelBean := s.ntripMap.Get(key)
-		if ntripChannelBean == nil {
-			ntripChannelBean = s.auth(conn, bytes)
-			if ntripChannelBean != nil {
-				authenticated = true
-				setReadDeadline(conn, 0)
-				s.ntripMap.Set(key, ntripChannelBean)
-				if s.onConnect != nil {
-					s.onConnect(key, ntripChannelBean.mount, conn)
+		data := buf[:n]
+		if bean == nil {
+			authBuf = append(authBuf, data...)
+			headerEnd := findNtripRequestHeaderEnd(authBuf)
+			if headerEnd < 0 {
+				if len(authBuf) > defaultNtripMaxHeaderSize {
+					_ = WriteData(conn, []byte("HTTP/1.0 431 Request Header Fields Too Large\r\nConnection: close\r\n\r\n"))
+					return
 				}
+				continue
 			}
-		} else {
-			if s.onData != nil {
-				s.onData(key, ntripChannelBean.mount, bytes, ntripChannelBean.extra)
+			bean = s.auth(conn, authBuf[:headerEnd])
+			if bean == nil {
+				return
 			}
+			setReadDeadline(conn, 0)
+			s.ntripMap.Set(key, bean)
+			onConnect, _, _, _, _, _ := s.callbacks()
+			if onConnect != nil {
+				onConnect(key, bean.mount, conn)
+			}
+			if payload := authBuf[headerEnd:]; len(payload) > 0 {
+				s.processClientData(key, bean, conn, payload)
+			}
+			authBuf = nil
+			continue
 		}
-		if ntripChannelBean != nil && s.onSize != nil && len(bytes) > 0 {
-			s.onSize(key, ntripChannelBean.mount, conn, len(bytes))
-		}
+		s.processClientData(key, bean, conn, data)
 	}
 }
 
-func (s *NtripCasterClient) auth(conn net.Conn, bytes []byte) *NtripChannelBean {
-	dataStr := string(bytes)
-	if strings.HasPrefix(dataStr, "GET") {
-		log.Println("✅ntrip caster client auth request received from: ", conn.RemoteAddr().String())
-		var authTag = false
-		splits := strings.Split(dataStr, "\r\n")
-		if len(splits) < 3 {
-			log.Println("auth data invalid from: ", conn.RemoteAddr().String())
-			_ = WriteData(conn, []byte("HTTP/1.0 401 Unauthorized\r\n"))
-			_ = conn.Close()
-			return nil
-		}
-		requestParts := strings.Fields(splits[0])
-		if len(requestParts) < 2 {
-			log.Println("auth data invalid from: ", conn.RemoteAddr().String())
-			_ = WriteData(conn, []byte("HTTP/1.0 401 Unauthorized\r\n"))
-			_ = conn.Close()
-			return nil
-		}
-		mount := strings.ReplaceAll(requestParts[1], "/", "")
-		authSplits := strings.Fields(splits[2])
-		if len(authSplits) < 3 {
-			log.Println("auth data invalid from: ", conn.RemoteAddr().String())
-			_ = WriteData(conn, []byte("HTTP/1.0 401 Unauthorized\r\n"))
-			_ = conn.Close()
-			return nil
-		}
-		auth := authSplits[2]
-		var username, password string
-		if strings.TrimSpace(auth) != "" {
-			authBytes, err := base64.StdEncoding.DecodeString(auth)
-			if err != nil {
-				log.Println("❌ntrip caster client error decoding base64:", err)
-				_ = WriteData(conn, []byte("HTTP/1.0 401 Unauthorized\r\n"))
-				_ = conn.Close()
-				return nil
-			}
-			authStr := string(authBytes)
-			split := strings.Split(authStr, ":")
-			if len(split) >= 2 {
-				username = split[0]
-				password = split[1]
-			}
-		}
-		if mount == username && username == password {
-			authTag = true
-		} else {
-			if s.onAuth != nil {
-				authTag = s.onAuth(mount, username, password)
-			}
-		}
-		var result string
-		if authTag {
-			result = "ICY 200 OK\r\nServer: Trimble-iGate/1.0\r\nDate:" + NowNtripDate() + "\r\n\r\n"
-		} else {
-			result = "HTTP/1.0 401 Unauthorized\r\n"
-		}
-		log.Println("✅ntrip caster client auth result: ", mount, username, maskSecret(password), result)
-		err := WriteData(conn, []byte(result))
-		if err != nil {
-			log.Println("❌ntrip caster client auth send data error:", err)
-			_ = conn.Close()
-			return nil
-		}
-		if !authTag {
-			_ = conn.Close()
-		} else {
-			return NewNtripChannelBean(mount, conn, password)
-		}
+func (s *NtripCasterClient) processClientData(key string, bean *NtripChannelBean, conn net.Conn, data []byte) {
+	if len(data) == 0 {
+		return
 	}
-	return nil
+	_, _, onData, onSize, _, _ := s.callbacks()
+	if onData != nil {
+		onData(key, bean.mount, cloneBytes(data), bean.extra)
+	}
+	if onSize != nil {
+		onSize(key, bean.mount, conn, len(data))
+	}
+}
+
+func (s *NtripCasterClient) auth(conn net.Conn, data []byte) *NtripChannelBean {
+	request, err := parseNtripRequest(data)
+	if err != nil || request.method != "GET" {
+		_ = WriteData(conn, []byte(ntripAuthResponse(false)))
+		return nil
+	}
+	username, password, err := parseBasicAuthorization(request.headers["authorization"])
+	if err != nil {
+		_ = WriteData(conn, []byte(ntripAuthResponseForRequest(false, request)))
+		return nil
+	}
+	_, _, _, _, onAuth, _ := s.callbacks()
+	authorized := request.target == username && username == password
+	if onAuth != nil {
+		authorized = onAuth(request.target, username, password)
+	}
+	if err := WriteData(conn, []byte(ntripAuthResponseForRequest(authorized, request))); err != nil || !authorized {
+		return nil
+	}
+	return NewNtripChannelBean(request.target, conn, password)
 }

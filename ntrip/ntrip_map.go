@@ -1,8 +1,9 @@
 package ntrip
 
 import (
-	"log"
+	"io"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,6 +29,7 @@ type NtripChannelBean struct {
 	quit      chan struct{}
 	bytesSent uint64
 	packets   uint64
+	dropped   uint64
 	once      sync.Once
 	closed    uint32
 }
@@ -47,43 +49,47 @@ func NewNtripChannelBean(mount string, conn net.Conn, extra string) *NtripChanne
 
 func (c *NtripChannelBean) writer() {
 	defer func() {
-		log.Printf("🛑channel bean writer for %s closed\n", c.mount)
+		logPrintf("🛑channel bean writer for %s closed\n", c.mount)
 		c.Close()
 	}()
 	for {
 		select {
 		case msg, ok := <-c.send:
 			if !ok {
-				log.Printf("❌channel bean send to %s is : %v\n", c.mount, false)
+				logPrintf("❌channel bean send to %s is : %v\n", c.mount, false)
 				return
 			}
 			if len(msg) == 0 {
 				continue
 			}
-			wrote := false
-			for attempt := 1; attempt <= 3; attempt++ {
+			written := 0
+			attempt := 0
+			for written < len(msg) {
 				_ = c.conn.SetWriteDeadline(time.Now().Add(defaultNtripWriteTimeout))
-				_, err := c.conn.Write(msg)
+				n, err := c.conn.Write(msg[written:])
+				written += n
 				if err == nil {
-					wrote = true
-					break
+					if n == 0 {
+						logPrintf("❌write failed to %s: %v\n", c.mount, io.ErrShortWrite)
+						return
+					}
+					attempt = 0
+					continue
 				}
-				if nerr, ok := err.(net.Error); ok && (nerr.Timeout() || nerr.Temporary()) {
-					log.Printf("⚠️retry #%d write timeout to %s...\n", attempt, c.mount)
+				if nerr, ok := err.(net.Error); ok && (nerr.Timeout() || nerr.Temporary()) && attempt < 3 {
+					attempt++
+					logPrintf("⚠️retry #%d write timeout to %s...\n", attempt, c.mount)
 					time.Sleep(100 * time.Millisecond)
 					continue
 				}
-				log.Printf("❌write failed to %s: %v (fatal)\n", c.mount, err)
+				logPrintf("❌write failed to %s: %v (fatal)\n", c.mount, err)
 				return
 			}
-			if !wrote {
-				log.Printf("❌write timeout to %s after retries\n", c.mount)
-				return
-			}
+			_ = c.conn.SetWriteDeadline(time.Time{})
 			atomic.AddUint64(&c.bytesSent, uint64(len(msg)))
 			atomic.AddUint64(&c.packets, 1)
 		case <-c.quit:
-			log.Printf("🟡quit signal for %s\n", c.mount)
+			logPrintf("🟡quit signal for %s\n", c.mount)
 			return
 		}
 	}
@@ -106,7 +112,8 @@ func (c *NtripChannelBean) Send(data []byte) {
 	select {
 	case c.send <- data:
 	case <-timer.C:
-		log.Printf("🛑send timeout for %s, slow consumer detected\n", c.mount)
+		atomic.AddUint64(&c.dropped, 1)
+		logPrintf("🛑send timeout for %s, slow consumer detected\n", c.mount)
 	}
 }
 
@@ -121,12 +128,14 @@ func (c *NtripChannelBean) SendLoss(data []byte) {
 	default:
 		select {
 		case <-c.send:
+			atomic.AddUint64(&c.dropped, 1)
 		default:
 		}
 		select {
 		case c.send <- data:
 		default:
-			log.Printf("🛑channel full for %s, drop latest packet\n", c.mount)
+			atomic.AddUint64(&c.dropped, 1)
+			logPrintf("🛑channel full for %s, drop latest packet\n", c.mount)
 		}
 	}
 }
@@ -148,8 +157,23 @@ func (c *NtripChannelBean) Close() {
 		if c.conn != nil {
 			_ = c.conn.Close()
 		}
-		log.Printf("🛑closed connection for mount %s\n", c.mount)
+		logPrintf("🛑closed connection for mount %s\n", c.mount)
 	})
+}
+
+// BytesSent returns the number of payload bytes written successfully.
+func (c *NtripChannelBean) BytesSent() uint64 {
+	return atomic.LoadUint64(&c.bytesSent)
+}
+
+// PacketsSent returns the number of payload packets written successfully.
+func (c *NtripChannelBean) PacketsSent() uint64 {
+	return atomic.LoadUint64(&c.packets)
+}
+
+// PacketsDropped returns the number of packets discarded due to backpressure.
+func (c *NtripChannelBean) PacketsDropped() uint64 {
+	return atomic.LoadUint64(&c.dropped)
 }
 
 type SafeNtripMap struct {
@@ -181,13 +205,15 @@ func (s *SafeNtripMap) Set(key string, val *NtripChannelBean) {
 	if old := s.data[key]; old != nil {
 		s.deleteMountIndexLocked(key, old.mount)
 	}
-	s.data[key] = val
-	if val != nil {
-		if s.byMount[val.mount] == nil {
-			s.byMount[val.mount] = make(map[string]*NtripChannelBean)
-		}
-		s.byMount[val.mount][key] = val
+	if val == nil {
+		delete(s.data, key)
+		return
 	}
+	s.data[key] = val
+	if s.byMount[val.mount] == nil {
+		s.byMount[val.mount] = make(map[string]*NtripChannelBean)
+	}
+	s.byMount[val.mount][key] = val
 }
 
 func (s *SafeNtripMap) Delete(key string) *NtripChannelBean {
@@ -224,8 +250,12 @@ func (s *SafeNtripMap) GetByMount(mount string) []*NtripChannelBean {
 
 func (s *SafeNtripMap) ForEachByMount(mount string, f func(*NtripChannelBean)) {
 	s.mu.RLock()
-	defer s.mu.RUnlock()
+	beans := make([]*NtripChannelBean, 0, len(s.byMount[mount]))
 	for _, bean := range s.byMount[mount] {
+		beans = append(beans, bean)
+	}
+	s.mu.RUnlock()
+	for _, bean := range beans {
 		f(bean)
 	}
 }
@@ -233,22 +263,34 @@ func (s *SafeNtripMap) ForEachByMount(mount string, f func(*NtripChannelBean)) {
 func (s *SafeNtripMap) GetMountList() []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	var result []string
+	unique := make(map[string]struct{}, len(s.byMount))
 	for _, bean := range s.data {
-		result = append(result, bean.mount)
+		if bean != nil {
+			unique[bean.mount] = struct{}{}
+		}
 	}
+	result := make([]string, 0, len(unique))
+	for mount := range unique {
+		result = append(result, mount)
+	}
+	sort.Strings(result)
 	return result
 }
 
 func (s *SafeNtripMap) QueryMountList(mount string) []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	var result []string
+	unique := make(map[string]struct{})
 	for _, bean := range s.data {
-		if strings.Contains(bean.mount, mount) {
-			result = append(result, bean.mount)
+		if bean != nil && strings.Contains(bean.mount, mount) {
+			unique[bean.mount] = struct{}{}
 		}
 	}
+	result := make([]string, 0, len(unique))
+	for candidate := range unique {
+		result = append(result, candidate)
+	}
+	sort.Strings(result)
 	return result
 }
 
@@ -268,6 +310,5 @@ func (s *SafeNtripMap) CloseAll() {
 
 	for _, bean := range beans {
 		bean.Close()
-		deleteMountBytes(bean.mount)
 	}
 }

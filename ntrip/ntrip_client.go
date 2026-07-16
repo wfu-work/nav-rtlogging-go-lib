@@ -2,10 +2,12 @@ package ntrip
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
-	"log"
+	"math/rand"
 	"net"
 	"strings"
 	"sync"
@@ -27,6 +29,10 @@ type NtripClient struct {
 	Latitude           float64
 	Altitude           float64
 	Extra              string
+	DialTimeout        time.Duration
+	TLSConfig          *tls.Config
+	UseNtripV2         bool
+	dial               func(string, int, time.Duration, *tls.Config) (net.Conn, error)
 	conn               net.Conn
 	connMu             sync.RWMutex
 	onConnect          OnConnectFunc
@@ -35,7 +41,15 @@ type NtripClient struct {
 	onNetErrorCallback OnNetErrorFunc
 	retrying           atomic.Bool
 	quit               chan struct{}
+	startMu            sync.Mutex
+	lifecycleMu        sync.Mutex
+	callbackMu         sync.RWMutex
 }
+
+const (
+	defaultNtripRetryInitial = 5 * time.Second
+	defaultNtripRetryMax     = time.Minute
+)
 
 func (c *NtripClient) getConn() net.Conn {
 	c.connMu.RLock()
@@ -86,94 +100,174 @@ func (c *NtripClient) closeConn() {
 	}
 }
 
+func (c *NtripClient) beginRun() chan struct{} {
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+	if c.quit == nil || isClosed(c.quit) {
+		c.quit = make(chan struct{})
+	}
+	return c.quit
+}
+
+func (c *NtripClient) currentRun() chan struct{} {
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+	if c.quit == nil {
+		c.quit = make(chan struct{})
+	}
+	return c.quit
+}
+
+func isClosed(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
 // OnConnect 设置连接回调
 func (c *NtripClient) OnConnect(f OnConnectFunc) {
+	c.callbackMu.Lock()
+	defer c.callbackMu.Unlock()
 	c.onConnect = f
 }
 
 // DisConnect 设置断开回调
 func (c *NtripClient) DisConnect(f OnDisConnectFunc) {
+	c.callbackMu.Lock()
+	defer c.callbackMu.Unlock()
 	c.onDisConnect = f
 }
 
 // OnNetErrorCallback 设置断开回调
 func (c *NtripClient) OnNetErrorCallback(f OnNetErrorFunc) {
+	c.callbackMu.Lock()
+	defer c.callbackMu.Unlock()
 	c.onNetErrorCallback = f
 }
 
 // OnDataCallback 设置断开回调
 func (c *NtripClient) OnDataCallback(f OnDataFunc) {
+	c.callbackMu.Lock()
+	defer c.callbackMu.Unlock()
 	c.onDataCallback = f
+}
+
+func (c *NtripClient) connectCallback() OnConnectFunc {
+	c.callbackMu.RLock()
+	defer c.callbackMu.RUnlock()
+	return c.onConnect
+}
+
+func (c *NtripClient) disconnectCallback() OnDisConnectFunc {
+	c.callbackMu.RLock()
+	defer c.callbackMu.RUnlock()
+	return c.onDisConnect
+}
+
+func (c *NtripClient) dataCallback() OnDataFunc {
+	c.callbackMu.RLock()
+	defer c.callbackMu.RUnlock()
+	return c.onDataCallback
+}
+
+func (c *NtripClient) notifyNetError(err error) {
+	c.callbackMu.RLock()
+	callback := c.onNetErrorCallback
+	c.callbackMu.RUnlock()
+	if callback != nil {
+		callback(err)
+	}
 }
 
 // NewLocalNtripClient creates a new NtripClient.
 func NewLocalNtripClient(mount string) *NtripClient {
 	return &NtripClient{
-		Host:     "127.0.0.1",
-		Port:     9095,
-		Mount:    mount,
-		Username: mount,
-		Password: mount,
-		IsGga:    false,
-		GgaTime:  5,
-		quit:     make(chan struct{}),
+		Host:        "127.0.0.1",
+		Port:        9095,
+		Mount:       mount,
+		Username:    mount,
+		Password:    mount,
+		IsGga:       false,
+		GgaTime:     5,
+		DialTimeout: 5 * time.Second,
+		dial:        dialNtrip,
+		quit:        make(chan struct{}),
 	}
 }
 
 // NewNtripClient creates a new NtripClient.
 func NewNtripClient(host string, port int, mount string, username string, password string) *NtripClient {
 	return &NtripClient{
-		Host:     host,
-		Port:     port,
-		Mount:    mount,
-		Username: username,
-		Password: password,
-		IsGga:    false,
-		GgaTime:  5,
-		quit:     make(chan struct{}),
+		Host:        host,
+		Port:        port,
+		Mount:       mount,
+		Username:    username,
+		Password:    password,
+		IsGga:       false,
+		GgaTime:     5,
+		DialTimeout: 5 * time.Second,
+		dial:        dialNtrip,
+		quit:        make(chan struct{}),
 	}
 }
 
 // NewNtripClientExtra creates a new NtripClient.
 func NewNtripClientExtra(host string, port int, mount string, username string, password string, extra string) *NtripClient {
 	return &NtripClient{
-		Host:     host,
-		Port:     port,
-		Mount:    mount,
-		Username: username,
-		Password: password,
-		IsGga:    false,
-		GgaTime:  5,
-		Extra:    extra,
-		quit:     make(chan struct{}),
+		Host:        host,
+		Port:        port,
+		Mount:       mount,
+		Username:    username,
+		Password:    password,
+		IsGga:       false,
+		GgaTime:     5,
+		Extra:       extra,
+		DialTimeout: 5 * time.Second,
+		dial:        dialNtrip,
+		quit:        make(chan struct{}),
 	}
 }
 
 // NewNtripClientGgaExtra creates a new NtripClient.
 func NewNtripClientGgaExtra(host string, port int, mount string, username string, password string, latitude float64, longitude float64, altitude float64, extra string) *NtripClient {
 	return &NtripClient{
-		Host:      host,
-		Port:      port,
-		Mount:     mount,
-		Username:  username,
-		Password:  password,
-		IsGga:     true,
-		GgaTime:   1,
-		Latitude:  latitude,
-		Longitude: longitude,
-		Altitude:  altitude,
-		Extra:     extra,
-		quit:      make(chan struct{}),
+		Host:        host,
+		Port:        port,
+		Mount:       mount,
+		Username:    username,
+		Password:    password,
+		IsGga:       true,
+		GgaTime:     1,
+		Latitude:    latitude,
+		Longitude:   longitude,
+		Altitude:    altitude,
+		Extra:       extra,
+		DialTimeout: 5 * time.Second,
+		dial:        dialNtrip,
+		quit:        make(chan struct{}),
 	}
 }
 
 func (c *NtripClient) Start() error {
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", c.Host, c.Port), 5*time.Second)
+	c.startMu.Lock()
+	if err := validateMount(c.Mount); err != nil {
+		c.startMu.Unlock()
+		c.notifyNetError(err)
+		return err
+	}
+	quit := c.beginRun()
+	dial := c.dial
+	if dial == nil {
+		dial = dialNtrip
+	}
+	conn, err := dial(c.Host, c.Port, c.DialTimeout, c.TLSConfig)
 	if err != nil {
-		log.Println("❌ntrip client start error: ", err, "exit!")
-		if c.onNetErrorCallback != nil {
-			c.onNetErrorCallback(err)
-		}
+		c.startMu.Unlock()
+		logPrintln("❌ntrip client start error: ", err, "exit!")
+		c.notifyNetError(err)
 		return err
 	}
 	enableTCPKeepAlive(conn)
@@ -181,61 +275,81 @@ func (c *NtripClient) Start() error {
 		_ = old.Close()
 	}
 	authMsg := createNtripAuthMsg(c.Mount, c.Username, c.Password)
-	_, err = conn.Write([]byte(authMsg))
-	if err != nil {
-		log.Println("❌ntrip client write error: ", err, "exit!")
+	if c.UseNtripV2 {
+		authMsg = createNtripAuthMsgV2(c.Mount, c.Username, c.Password, ntripAddress(c.Host, c.Port))
+	}
+	if err = WriteData(conn, []byte(authMsg)); err != nil {
+		logPrintln("❌ntrip client write error: ", err, "exit!")
 		c.closeConnIfCurrent(conn)
-		if c.onNetErrorCallback != nil {
-			c.onNetErrorCallback(err)
-		}
+		c.startMu.Unlock()
+		c.notifyNetError(err)
 		return err
 	}
-	log.Println("✅ntrip client send auth msg for mount: ", c.Mount)
-	go c.handleConn(conn)
+	logPrintln("✅ntrip client send auth msg for mount: ", c.Mount)
+	go c.handleConnWithQuit(conn, quit)
+	c.startMu.Unlock()
 	return nil
 }
 
 func (c *NtripClient) Stop() {
-	safeClose(c.quit)
+	c.startMu.Lock()
+	safeClose(c.currentRun())
 	c.closeConn()
+	c.startMu.Unlock()
 }
 
 func (c *NtripClient) Retry() {
-	if c.quit != nil {
-		select {
-		case <-c.quit:
-			return
-		default:
-		}
+	quit := c.currentRun()
+	if isClosed(quit) {
+		return
 	}
 	if !c.retrying.CompareAndSwap(false, true) {
 		return
 	}
-	fmt.Printf("❌ntrip client %s-%d-%s-%s-%s 连接失败5秒后重试...\n", c.Host, c.Port, c.Mount, c.Username, maskSecret(c.Password))
+	logPrintf("ntrip client %s-%d-%s will retry connection", c.Host, c.Port, c.Mount)
 	go func() {
 		defer c.retrying.Store(false)
-		ticker := time.NewTicker(time.Duration(5) * time.Second)
-		defer ticker.Stop()
+		delay := defaultNtripRetryInitial
+		timer := time.NewTimer(jitterRetryDelay(delay))
+		defer timer.Stop()
 		for {
 			select {
-			case <-c.quit:
+			case <-quit:
 				return
-			case <-ticker.C:
+			case <-timer.C:
 				if c.getConn() != nil {
 					return
 				}
-				err := c.Start()
-				if err != nil {
-					fmt.Printf("❌ntrip client %s-%d-%s-%s-%s 连接失败5秒后重试...\n", c.Host, c.Port, c.Mount, c.Username, maskSecret(c.Password))
-					break
+				if err := c.Start(); err == nil {
+					return
 				}
-				return
+				delay *= 2
+				if delay > defaultNtripRetryMax {
+					delay = defaultNtripRetryMax
+				}
+				logPrintf("ntrip client %s-%d-%s connection failed; retrying in %s", c.Host, c.Port, c.Mount, delay)
+				timer.Reset(jitterRetryDelay(delay))
 			}
 		}
 	}()
 }
 
+func jitterRetryDelay(delay time.Duration) time.Duration {
+	spread := delay / 5
+	if spread <= 0 {
+		return delay
+	}
+	return delay - spread/2 + time.Duration(rand.Int63n(int64(spread)+1))
+}
+
 func (c *NtripClient) handleConn(conn net.Conn) {
+	if c.getConn() == nil {
+		c.setConn(conn)
+	}
+	c.handleConnWithQuit(conn, c.currentRun())
+}
+
+func (c *NtripClient) handleConnWithQuit(conn net.Conn, quit <-chan struct{}) {
 	connDone := make(chan struct{})
 	defer close(connDone)
 
@@ -249,8 +363,8 @@ func (c *NtripClient) handleConn(conn net.Conn) {
 			return
 		}
 		disconnectOnce.Do(func() {
-			if c.onDisConnect != nil {
-				c.onDisConnect(conn.LocalAddr().String(), c.Mount)
+			if callback := c.disconnectCallback(); callback != nil {
+				callback(conn.LocalAddr().String(), c.Mount)
 			}
 		})
 	}
@@ -267,17 +381,16 @@ func (c *NtripClient) handleConn(conn net.Conn) {
 			defer ticker.Stop()
 			for {
 				select {
-				case <-c.quit:
-					log.Println("🛑GGA发送停止:", c.Mount)
+				case <-quit:
+					logPrintln("🛑GGA发送停止:", c.Mount)
 					return
 				case <-connDone:
-					log.Println("🛑GGA发送停止:", c.Mount)
+					logPrintln("🛑GGA发送停止:", c.Mount)
 					return
 				case <-ticker.C:
 					gga := GenerateGGA(c.Latitude, c.Longitude, c.Altitude)
-					_, err := conn.Write([]byte(gga))
-					if err != nil {
-						log.Println("❌发送GGA数据失败:", err)
+					if err := WriteData(conn, []byte(gga)); err != nil {
+						logPrintln("❌发送GGA数据失败:", err)
 						if c.closeConnIfCurrent(conn) {
 							notifyDisconnect()
 						}
@@ -288,10 +401,12 @@ func (c *NtripClient) handleConn(conn net.Conn) {
 		}()
 	}
 	deliverData := func(data []byte) {
-		if len(data) == 0 || c.onDataCallback == nil {
+		if len(data) == 0 {
 			return
 		}
-		c.onDataCallback(conn.LocalAddr().String(), c.Mount, cloneBytes(data), c.Extra)
+		if callback := c.dataCallback(); callback != nil {
+			callback(conn.LocalAddr().String(), c.Mount, cloneBytes(data), c.Extra)
+		}
 	}
 
 	go func() {
@@ -299,15 +414,15 @@ func (c *NtripClient) handleConn(conn net.Conn) {
 		defer ticker.Stop()
 		for {
 			select {
-			case <-c.quit:
-				log.Println("🛑ntrip client read time out quit signal received:", c.Mount)
+			case <-quit:
+				logPrintln("🛑ntrip client read time out quit signal received:", c.Mount)
 				return
 			case <-connDone:
 				return
 			case <-ticker.C:
 				last := time.Unix(0, lastDataTime.Load())
 				if time.Since(last) > defaultNtripClientIdleTimeout {
-					log.Println("⏱️超过60秒未收到数据，断开连接:", c.Mount)
+					logPrintln("⏱️超过60秒未收到数据，断开连接:", c.Mount)
 					if c.closeConnIfCurrent(conn) {
 						notifyDisconnect()
 					}
@@ -320,31 +435,42 @@ func (c *NtripClient) handleConn(conn net.Conn) {
 	buf := make([]byte, 1024)
 	for {
 		select {
-		case <-c.quit:
-			log.Println("🛑ntrip client quit signal received:", c.Mount)
+		case <-quit:
+			logPrintln("🛑ntrip client quit signal received:", c.Mount)
 			if c.closeConnIfCurrent(conn) {
 				notifyDisconnect()
 			}
 			return
 		default:
+			if !connected.Load() {
+				setReadDeadline(conn, defaultNtripAuthTimeout)
+			}
 			n, err := conn.Read(buf)
 			if err != nil {
 				if err == io.EOF {
-					if c.closeConnIfCurrent(conn) {
+					wasCurrent := c.closeConnIfCurrent(conn)
+					if wasCurrent {
 						notifyDisconnect()
+					}
+					if wasCurrent && !connected.Load() && !isClosed(quit) {
+						c.notifyNetError(io.EOF)
 					}
 					return
 				}
-				log.Println("❌ntrip client error reading:", err)
-				if strings.Contains(err.Error(), "use of closed network connection") {
-					log.Printf("ℹ️连接已关闭（忽略重复错误）: %s\n", c.Mount)
+				logPrintln("❌ntrip client error reading:", err)
+				if errors.Is(err, net.ErrClosed) {
+					logPrintf("ℹ️连接已关闭（忽略重复错误）: %s\n", c.Mount)
 					if c.clearConnIfCurrent(conn) {
 						notifyDisconnect()
 					}
 					return
 				}
-				if c.closeConnIfCurrent(conn) {
+				wasCurrent := c.closeConnIfCurrent(conn)
+				if wasCurrent {
 					notifyDisconnect()
+				}
+				if wasCurrent && !connected.Load() && !isClosed(quit) {
+					c.notifyNetError(fmt.Errorf("read ntrip authentication response: %w", err))
 				}
 				return
 			}
@@ -356,31 +482,41 @@ func (c *NtripClient) handleConn(conn net.Conn) {
 			if !connected.Load() {
 				responseBuf = append(responseBuf, data...)
 				if bytes.Contains(responseBuf, []byte("401 Unauthorized")) || bytes.Contains(responseBuf, []byte("Bad Request")) || bytes.Contains(responseBuf, []byte("Mount Point Is Not Exit")) {
-					log.Println("❌ntrip client auth failed! ", c.Mount, c.Username, maskSecret(c.Password))
-					c.closeConnIfCurrent(conn)
+					logPrintln("❌ntrip client auth failed! ", c.Mount, c.Username, maskSecret(c.Password))
+					if c.closeConnIfCurrent(conn) {
+						c.notifyNetError(fmt.Errorf("ntrip authentication failed for mount %q", c.Mount))
+					}
 					return
 				}
 				headerEnd := findNtripResponseHeaderEnd(responseBuf)
 				if headerEnd < 0 {
 					if len(responseBuf) > defaultNtripMaxHeaderSize {
-						log.Println("❌ntrip client auth response too large:", c.Mount)
-						c.closeConnIfCurrent(conn)
+						logPrintln("❌ntrip client auth response too large:", c.Mount)
+						if c.closeConnIfCurrent(conn) {
+							c.notifyNetError(fmt.Errorf("ntrip authentication response exceeds %d bytes", defaultNtripMaxHeaderSize))
+						}
 						return
 					}
 					continue
 				}
 				header := responseBuf[:headerEnd]
 				payload := responseBuf[headerEnd:]
-				if !bytes.Contains(header, []byte("ICY 200 OK")) {
-					log.Println("❌ntrip client auth unexpected response:", c.Mount, string(header))
-					c.closeConnIfCurrent(conn)
+				if !isNtripSuccessHeader(header) {
+					logPrintln("❌ntrip client auth unexpected response:", c.Mount, string(header))
+					if c.closeConnIfCurrent(conn) {
+						c.notifyNetError(fmt.Errorf("unexpected ntrip authentication response: %q", firstLine(header)))
+					}
+					return
+				}
+				if c.getConn() != conn {
+					_ = conn.Close()
 					return
 				}
 				if connected.CompareAndSwap(false, true) {
-					log.Println("✅ntrip client auth ok! ", c.Mount, c.Username, maskSecret(c.Password))
-					c.setConn(conn)
-					if c.onConnect != nil {
-						c.onConnect(conn.LocalAddr().String(), c.Mount, conn)
+					setReadDeadline(conn, 0)
+					logPrintln("✅ntrip client auth ok! ", c.Mount, c.Username, maskSecret(c.Password))
+					if callback := c.connectCallback(); callback != nil {
+						callback(conn.LocalAddr().String(), c.Mount, conn)
 					}
 					startGGA()
 				}
@@ -394,6 +530,23 @@ func (c *NtripClient) handleConn(conn net.Conn) {
 	}
 }
 
+func isNtripSuccessHeader(header []byte) bool {
+	line := strings.ToUpper(firstLine(header))
+	return strings.HasPrefix(line, "ICY 200 ") ||
+		strings.HasPrefix(line, "HTTP/1.0 200 ") ||
+		strings.HasPrefix(line, "HTTP/1.1 200 ")
+}
+
+func firstLine(data []byte) string {
+	line := data
+	if end := bytes.Index(line, []byte("\r\n")); end >= 0 {
+		line = line[:end]
+	} else if end := bytes.IndexByte(line, '\n'); end >= 0 {
+		line = line[:end]
+	}
+	return strings.TrimSpace(string(line))
+}
+
 // createNtripAuthMsg creates a Ntrip authentication message.
 func createNtripAuthMsg(mountPoint, username, password string) string {
 	head := fmt.Sprintf("GET /%s HTTP/1.0\r\n", mountPoint)
@@ -404,6 +557,19 @@ func createNtripAuthMsg(mountPoint, username, password string) string {
 	}
 	head += "Accept: */*\r\n"
 	head += "\r\n"
+	return head
+}
+
+func createNtripAuthMsgV2(mountPoint, username, password, host string) string {
+	head := fmt.Sprintf("GET /%s HTTP/1.1\r\n", mountPoint)
+	head += fmt.Sprintf("Host: %s\r\n", host)
+	head += "Ntrip-Version: Ntrip/2.0\r\n"
+	head += "User-Agent: NTRIP nav-rtlogging-go-lib\r\n"
+	if utf8.RuneCountInString(username) > 0 && utf8.RuneCountInString(password) > 0 {
+		auth := base64.StdEncoding.EncodeToString([]byte(username + ":" + password))
+		head += fmt.Sprintf("Authorization: Basic %s\r\n", auth)
+	}
+	head += "Accept: */*\r\n\r\n"
 	return head
 }
 
@@ -442,8 +608,10 @@ func looksLikeHeaderContinuation(data []byte) bool {
 		return true
 	}
 	line := data
+	lineComplete := false
 	if lineEnd := bytes.Index(line, []byte("\r\n")); lineEnd >= 0 {
 		line = line[:lineEnd]
+		lineComplete = true
 	}
 	if len(line) == 0 {
 		return true
@@ -453,16 +621,25 @@ func looksLikeHeaderContinuation(data []byte) bool {
 			return false
 		}
 	}
-	if bytes.Contains(line, []byte(":")) {
+	if colon := bytes.IndexByte(line, ':'); colon > 0 {
+		for _, b := range line[:colon] {
+			if (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || b == '-' {
+				continue
+			}
+			return false
+		}
 		return true
 	}
-	for _, b := range line {
-		if (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || b == '-' {
-			continue
-		}
+	if lineComplete {
 		return false
 	}
-	return len(line) < 64
+	prefix := strings.ToLower(string(line))
+	for _, knownHeader := range []string{"server:", "date:", "ntrip-version:", "content-type:", "connection:"} {
+		if strings.HasPrefix(knownHeader, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func safeClose(ch chan struct{}) {

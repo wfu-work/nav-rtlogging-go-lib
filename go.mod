@@ -1,3 +1,3 @@
 module github.com/wfu-work/nav-rtlogging-go-lib
 
-go 1.24
+go 1.26.0

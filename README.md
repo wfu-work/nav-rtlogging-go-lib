@@ -1,6 +1,6 @@
 # nav-rtlogging-go-lib
 
-[![Go Version](https://img.shields.io/badge/Go-1.24%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)
+[![Go Version](https://img.shields.io/badge/Go-1.26%2B-00ADD8?logo=go&logoColor=white)](https://go.dev/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 `nav-rtlogging-go-lib` 是一个面向 RTK、差分数据链路和本地网络联调场景的 Go 通信库。它封装了 NTRIP Client、NTRIP Server、轻量级 NTRIP Caster，以及基础 TCP Client/Server，帮助业务系统快速接入、转发和调试 RTCM 等实时数据流。
@@ -77,8 +77,8 @@ import (
 )
 
 func main() {
-	sourceSide := ntrip.NewNtripCasterServer(9090)
-	clientSide := ntrip.NewNtripCasterClient(9095)
+	sourceSide := ntrip.NewNtripCasterServerOnAddress("127.0.0.1", 9090)
+	clientSide := ntrip.NewNtripCasterClientOnAddress("127.0.0.1", 9095)
 
 	sourceSide.OnAuth(func(mount, username, password string) bool {
 		return mount == password
@@ -102,6 +102,8 @@ func main() {
 	if err := clientSide.Start(); err != nil {
 		log.Fatal(err)
 	}
+	defer sourceSide.Stop()
+	defer clientSide.Stop()
 
 	select {}
 }
@@ -111,6 +113,34 @@ func main() {
 
 ```go
 sourceSide, clientSide := ntrip.InitNtripCaster(9090, 9095)
+_ = sourceSide
+_ = clientSide
+```
+
+内置初始化默认只监听 `127.0.0.1`。对外提供服务时必须在启动前显式提供两端的业务认证：
+
+```go
+sourceSide, clientSide, err := ntrip.InitNtripCasterWithConfig(ntrip.NtripCasterConfig{
+	BindAddress: "0.0.0.0",
+	SourcePort:  9090,
+	ClientPort:  9095,
+	SourceAuth: func(mount, username, password string) bool {
+		return checkSourceCredential(mount, username, password)
+	},
+	ClientAuth: func(mount, username, password string) bool {
+		return checkClientCredential(mount, username, password)
+	},
+})
+```
+
+生产代码建议使用可返回监听错误的初始化入口，避免端口冲突时得到部分启动的 Caster：
+
+```go
+sourceSide, clientSide, err := ntrip.InitNtripCasterWithError(9090, 9095)
+if err != nil {
+	log.Fatal(err)
+}
+defer ntrip.StopNtripCaster()
 _ = sourceSide
 _ = clientSide
 ```
@@ -164,6 +194,7 @@ func main() {
 	if err := client.Start(); err != nil {
 		log.Fatal(err)
 	}
+	defer client.Stop()
 
 	select {}
 }
@@ -183,6 +214,14 @@ client := ntrip.NewNtripClientGgaExtra(
 	10.0,
 	"",
 )
+```
+
+NTRIP v2 或 TLS Caster 可以通过连接配置启用：
+
+```go
+client.UseNtripV2 = true
+client.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+client.DialTimeout = 10 * time.Second
 ```
 
 ### 作为 NTRIP 数据源推送数据
@@ -208,7 +247,7 @@ func main() {
 
 	server.OnConnect(func(key, mount string, conn net.Conn) {
 		log.Println("source connected:", key, mount)
-		_ = ntrip.WriteData(conn, []byte("rtcm bytes"))
+		_ = server.Write([]byte("rtcm bytes"))
 	})
 
 	server.DisConnect(func(key, mount string) {
@@ -218,6 +257,7 @@ func main() {
 	if err := server.Start(); err != nil {
 		log.Fatal(err)
 	}
+	defer server.Stop()
 
 	select {}
 }
@@ -255,6 +295,7 @@ func main() {
 	if err := server.Start(); err != nil {
 		log.Fatal(err)
 	}
+	defer server.Stop()
 
 	select {}
 }
@@ -290,6 +331,7 @@ func main() {
 	if err := client.Start(); err != nil {
 		log.Fatal(err)
 	}
+	defer client.Stop()
 
 	select {}
 }
@@ -305,17 +347,25 @@ func main() {
 | `NewNtripClientExtra(host, port, mount, username, password, extra)` | 创建带扩展字段的 NTRIP 客户端。 |
 | `NewNtripClientGgaExtra(host, port, mount, username, password, latitude, longitude, altitude, extra)` | 创建可发送 GGA 的 NTRIP 客户端。 |
 | `NewNtripServer(host, port, mount, username, password)` | 创建 NTRIP 数据源客户端，用于向 Caster 推送数据。 |
-| `NewNtripCasterServer(port)` | 创建 Caster 数据源接入端。 |
-| `NewNtripCasterClient(port)` | 创建 Caster 客户端订阅端。 |
+| `NewNtripCasterServer(port)` | 创建默认绑定到 `127.0.0.1` 的 Caster 数据源接入端。 |
+| `NewNtripCasterClient(port)` | 创建默认绑定到 `127.0.0.1` 的 Caster 客户端订阅端。 |
+| `NewNtripCasterServerOnAddress(host, port)` | 创建绑定到指定地址的 Caster 数据源接入端。 |
+| `NewNtripCasterClientOnAddress(host, port)` | 创建绑定到指定地址的 Caster 客户端订阅端。 |
 | `InitNtripCaster(serverPort, clientPort)` | 使用默认逻辑快速初始化本地 Caster。 |
+| `InitNtripCasterWithError(serverPort, clientPort)` | 初始化本地 Caster，并在任一监听端启动失败时回滚和返回错误。 |
+| `InitNtripCasterWithAddress(host, serverPort, clientPort)` | 使用开发认证在指定回环地址初始化 Caster。 |
+| `InitNtripCasterWithConfig(config)` | 使用显式绑定地址和认证配置初始化 Caster；非回环地址强制要求认证回调。 |
 | `GenerateGGA(latitude, longitude, altitude)` | 生成 `$GPGGA` 语句。 |
+| `GenerateGGAChecked(latitude, longitude, altitude)` | 校验经纬度和高程后生成 `$GPGGA` 语句。 |
 | `WriteData(conn, data)` | 向指定连接写入数据。 |
+| `SetLogger(logger)` | 注入库日志实现；传入 `nil` 可关闭库日志。 |
 
 ### tcp 包
 
 | API | 说明 |
 | --- | --- |
 | `NewTcps(port)` | 创建 TCP Server。 |
+| `NewTcpsOnAddress(host, port)` | 创建绑定到指定地址的 TCP Server。 |
 | `NewTcpClient(host, port)` | 创建 TCP Client。 |
 
 ### 常用回调
@@ -356,12 +406,18 @@ cd nav-rtlogging-go-lib
 go test ./...
 ```
 
-注意：仓库中包含用于真实网络环境的手动联调用例，例如需要外部 Caster、真实账号或会通过 `select {}` 持续阻塞的测试。将其接入 CI 前，建议先为手动联调用例补充 build tag，或拆分为独立的集成测试命令。
+真实网络环境的手动联调用例使用 `integration` build tag 隔离，不会进入默认测试。需要联调外部 Caster 时运行：
+
+```bash
+go test -tags=integration ./ntrip -run 'TestNtripClient|TestNtripCasterServer|TestTcpc'
+```
+
+这些用例会持续运行，应由调用方通过测试超时或中断信号结束。
 
 代码格式化：
 
 ```bash
-gofmt -w ntrip tcp
+gofmt -w ntrip/*.go tcp/*.go
 ```
 
 ## 贡献指南

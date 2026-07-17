@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -49,7 +50,7 @@ func parseNtripRequest(data []byte) (ntripRequest, error) {
 	default:
 		request.target = normalizeMount(parts[1])
 	}
-	if request.target == "" {
+	if request.target == "" && request.method != "GET" {
 		return ntripRequest{}, errors.New("empty ntrip mount point")
 	}
 	for _, line := range lines[1:] {
@@ -85,18 +86,65 @@ func parseBasicAuthorization(value string) (string, string, error) {
 
 func ntripAuthResponse(authorized bool) string {
 	if !authorized {
-		return "HTTP/1.0 401 Unauthorized\r\nConnection: close\r\n\r\n"
+		return "HTTP/1.0 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"NTRIP\"\r\nConnection: close\r\n\r\n"
 	}
 	return "ICY 200 OK\r\nServer: nav-rtlogging-go-lib\r\nDate: " + NowNtripDate() + "\r\n\r\n"
 }
 
 func ntripAuthResponseForRequest(authorized bool, request ntripRequest) string {
-	isV2 := len(request.parts) >= 3 && strings.EqualFold(request.parts[2], "HTTP/1.1")
-	if !isV2 {
+	if !isNtripV2Request(request) {
 		return ntripAuthResponse(authorized)
 	}
 	if !authorized {
-		return "HTTP/1.1 401 Unauthorized\r\nNtrip-Version: Ntrip/2.0\r\nConnection: close\r\n\r\n"
+		return "HTTP/1.1 401 Unauthorized\r\nNtrip-Version: Ntrip/2.0\r\nWWW-Authenticate: Basic realm=\"NTRIP\"\r\nConnection: close\r\n\r\n"
 	}
 	return "HTTP/1.1 200 OK\r\nNtrip-Version: Ntrip/2.0\r\nServer: nav-rtlogging-go-lib\r\nDate: " + NowNtripDate() + "\r\n\r\n"
+}
+
+func ntripConflictResponseForRequest(request ntripRequest) string {
+	if isNtripV2Request(request) {
+		return "HTTP/1.1 409 Conflict\r\nNtrip-Version: Ntrip/2.0\r\nConnection: close\r\n\r\n"
+	}
+	return "HTTP/1.0 409 Conflict\r\nConnection: close\r\n\r\n"
+}
+
+func ntripNotFoundResponseForRequest(request ntripRequest) string {
+	if isNtripV2Request(request) {
+		return "HTTP/1.1 404 Not Found\r\nNtrip-Version: Ntrip/2.0\r\nConnection: close\r\n\r\n"
+	}
+	return "HTTP/1.0 404 Not Found\r\nConnection: close\r\n\r\n"
+}
+
+func ntripSourcetableResponse(request ntripRequest, mounts []string) string {
+	var body strings.Builder
+	for _, mount := range mounts {
+		// A sourcetable uses semicolons as field separators. Mount points are
+		// validated when sources connect, but skip malformed legacy entries too.
+		if mount == "" || strings.ContainsAny(mount, ";\r\n") {
+			continue
+		}
+		body.WriteString("STR;")
+		body.WriteString(mount)
+		body.WriteByte(';')
+		body.WriteString(mount)
+		body.WriteString(";RTCM 3;;;;;;0.0000;0.0000;0;0;nav-rtlogging-go-lib;none;B;N;0;\r\n")
+	}
+	body.WriteString("ENDSOURCETABLE\r\n")
+	payload := body.String()
+
+	var response strings.Builder
+	if isNtripV2Request(request) {
+		response.WriteString("HTTP/1.1 200 OK\r\nNtrip-Version: Ntrip/2.0\r\nServer: nav-rtlogging-go-lib\r\nContent-Type: gnss/sourcetable\r\n")
+	} else {
+		response.WriteString("SOURCETABLE 200 OK\r\nServer: nav-rtlogging-go-lib\r\nContent-Type: text/plain\r\n")
+	}
+	response.WriteString("Content-Length: ")
+	response.WriteString(strconv.Itoa(len(payload)))
+	response.WriteString("\r\nConnection: close\r\n\r\n")
+	response.WriteString(payload)
+	return response.String()
+}
+
+func isNtripV2Request(request ntripRequest) bool {
+	return len(request.parts) >= 3 && strings.EqualFold(request.parts[2], "HTTP/1.1")
 }

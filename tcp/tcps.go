@@ -1,10 +1,12 @@
 package tcp
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
@@ -17,18 +19,22 @@ type OnSizeFunc func(conn net.Conn, size int)
 
 // Server accepts TCP connections and dispatches connection callbacks.
 type Server struct {
-	addr       string
-	ln         net.Listener
-	listen     func(network, address string) (net.Listener, error)
-	conns      map[net.Conn]struct{}
-	mu         sync.RWMutex
-	callbackMu sync.RWMutex
-	onConnect  OnConnectFunc
-	disConnect DisConnectFunc
-	onData     OnDataFunc
-	onSize     OnSizeFunc
-	netError   NetErrorFunc
-	done       chan struct{}
+	addr                string
+	ln                  net.Listener
+	listen              func(network, address string) (net.Listener, error)
+	conns               map[net.Conn]string
+	connectionsByIP     map[string]int
+	mu                  sync.RWMutex
+	callbackMu          sync.RWMutex
+	onConnect           OnConnectFunc
+	disConnect          DisConnectFunc
+	onData              OnDataFunc
+	onSize              OnSizeFunc
+	netError            NetErrorFunc
+	done                chan struct{}
+	maxConnections      int
+	maxConnectionsPerIP int
+	wg                  sync.WaitGroup
 }
 
 // NewTcps creates a new TCP server.
@@ -39,11 +45,43 @@ func NewTcps(port int) *Server {
 // NewTcpsOnAddress creates a TCP server bound to host.
 func NewTcpsOnAddress(host string, port int) *Server {
 	return &Server{
-		addr:   net.JoinHostPort(host, fmt.Sprintf("%d", port)),
-		listen: net.Listen,
-		conns:  make(map[net.Conn]struct{}),
-		done:   make(chan struct{}),
+		addr:            net.JoinHostPort(host, fmt.Sprintf("%d", port)),
+		listen:          net.Listen,
+		conns:           make(map[net.Conn]string),
+		connectionsByIP: make(map[string]int),
+		done:            make(chan struct{}),
+		maxConnections:  1024,
 	}
+}
+
+// SetMaxConnectionsPerIP sets the maximum number of accepted connections
+// from one remote IP address. A value of zero disables the per-IP limit.
+func (s *Server) SetMaxConnectionsPerIP(limit int) error {
+	if limit < 0 {
+		return errors.New("tcp server max connections per IP cannot be negative")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ln != nil {
+		return errors.New("cannot change tcp server max connections per IP while running")
+	}
+	s.maxConnectionsPerIP = limit
+	return nil
+}
+
+// SetMaxConnections sets the maximum number of accepted connections. A value
+// of zero disables the limit. It must be called before Start.
+func (s *Server) SetMaxConnections(limit int) error {
+	if limit < 0 {
+		return errors.New("tcp server max connections cannot be negative")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ln != nil {
+		return errors.New("cannot change tcp server max connections while running")
+	}
+	s.maxConnections = limit
+	return nil
 }
 
 func (s *Server) OnConnect(f OnConnectFunc) {
@@ -113,9 +151,13 @@ func (s *Server) Start() error {
 	}
 	s.ln = ln
 	done := s.done
+	s.wg.Add(1)
 	s.mu.Unlock()
 
-	go s.acceptLoop(ln, done)
+	go func() {
+		defer s.wg.Done()
+		s.acceptLoop(ln, done)
+	}()
 	return nil
 }
 
@@ -168,13 +210,29 @@ func (s *Server) acceptLoop(ln net.Listener, done <-chan struct{}) {
 			_ = conn.Close()
 			continue
 		}
-		s.conns[conn] = struct{}{}
-		s.mu.Unlock()
-		onConnect, _, _, _, _ := s.callbacks()
-		if onConnect != nil {
-			onConnect(conn)
+		if s.maxConnections > 0 && len(s.conns) >= s.maxConnections {
+			s.mu.Unlock()
+			_ = conn.Close()
+			continue
 		}
-		go s.handleConn(conn)
+		ip := remoteIP(conn.RemoteAddr())
+		if s.maxConnectionsPerIP > 0 && s.connectionsByIP[ip] >= s.maxConnectionsPerIP {
+			s.mu.Unlock()
+			_ = conn.Close()
+			continue
+		}
+		s.conns[conn] = ip
+		s.connectionsByIP[ip]++
+		s.wg.Add(1)
+		s.mu.Unlock()
+		go func(conn net.Conn) {
+			defer s.wg.Done()
+			onConnect, _, _, _, _ := s.callbacks()
+			if onConnect != nil {
+				onConnect(conn)
+			}
+			s.handleConn(conn)
+		}(conn)
 	}
 }
 
@@ -190,7 +248,8 @@ func (s *Server) Stop() error {
 	for conn := range s.conns {
 		conns = append(conns, conn)
 	}
-	s.conns = make(map[net.Conn]struct{})
+	s.conns = make(map[net.Conn]string)
+	s.connectionsByIP = make(map[string]int)
 	s.mu.Unlock()
 
 	var err error
@@ -203,11 +262,45 @@ func (s *Server) Stop() error {
 	return err
 }
 
+// Shutdown stops the listener and waits for accepted connections and the
+// accept loop to exit.
+func (s *Server) Shutdown(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	err := s.Stop()
+	if waitErr := waitGroupContext(ctx, &s.wg); waitErr != nil {
+		return waitErr
+	}
+	return err
+}
+
+func waitGroupContext(ctx context.Context, wg *sync.WaitGroup) error {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (s *Server) handleConn(conn net.Conn) {
 	defer func() {
 		s.mu.Lock()
-		_, wasActive := s.conns[conn]
-		delete(s.conns, conn)
+		ip, wasActive := s.conns[conn]
+		if wasActive {
+			delete(s.conns, conn)
+			if s.connectionsByIP[ip] <= 1 {
+				delete(s.connectionsByIP, ip)
+			} else {
+				s.connectionsByIP[ip]--
+			}
+		}
 		s.mu.Unlock()
 		_ = conn.Close()
 		if wasActive {
@@ -239,4 +332,23 @@ func (s *Server) handleConn(conn net.Conn) {
 			onSize(conn, n)
 		}
 	}
+}
+
+func remoteIP(addr net.Addr) string {
+	if addr == nil {
+		return "unknown"
+	}
+	if tcpAddr, ok := addr.(*net.TCPAddr); ok {
+		if ip := tcpAddr.IP.String(); ip != "" {
+			return ip
+		}
+	}
+	host, _, err := net.SplitHostPort(addr.String())
+	if err == nil && host != "" {
+		return strings.Trim(host, "[]")
+	}
+	if value := strings.TrimSpace(addr.String()); value != "" {
+		return value
+	}
+	return "unknown"
 }

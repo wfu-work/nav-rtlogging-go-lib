@@ -1,6 +1,7 @@
 package tcp
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -20,7 +21,11 @@ type TcpClient struct {
 	connMu       sync.RWMutex
 	startMu      sync.Mutex
 	callbackMu   sync.RWMutex
-	dial         func(network, address string, timeout time.Duration) (net.Conn, error)
+	writeMu      sync.Mutex
+	dial         func(context.Context, string, string, time.Duration) (net.Conn, error)
+	dialMu       sync.Mutex
+	dialCancel   context.CancelFunc
+	wg           sync.WaitGroup
 	onConnect    OnConnectFunc
 	onDisConnect DisConnectFunc
 	onData       OnDataFunc
@@ -86,12 +91,25 @@ func (c *TcpClient) callbacks() (OnConnectFunc, DisConnectFunc, OnDataFunc, NetE
 
 // NewTcpClient creates a new TcpClient.
 func NewTcpClient(host string, port int) *TcpClient {
-	return &TcpClient{Host: host, Port: port, DialTimeout: 30 * time.Second, dial: net.DialTimeout}
+	return &TcpClient{Host: host, Port: port, DialTimeout: 30 * time.Second, dial: dialTCP}
+}
+
+func dialTCP(ctx context.Context, network, address string, timeout time.Duration) (net.Conn, error) {
+	dialer := &net.Dialer{Timeout: timeout}
+	return dialer.DialContext(ctx, network, address)
 }
 
 // Start connects to the configured endpoint. Calling Start again replaces the
 // previous connection.
 func (c *TcpClient) Start() error {
+	return c.Connect(context.Background())
+}
+
+// Connect establishes the TCP connection using ctx for cancellation.
+func (c *TcpClient) Connect(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	c.startMu.Lock()
 	timeout := c.DialTimeout
 	if timeout <= 0 {
@@ -100,9 +118,17 @@ func (c *TcpClient) Start() error {
 	address := net.JoinHostPort(c.Host, strconv.Itoa(c.Port))
 	dial := c.dial
 	if dial == nil {
-		dial = net.DialTimeout
+		dial = dialTCP
 	}
-	conn, err := dial("tcp", address, timeout)
+	dialCtx, cancel := context.WithCancel(ctx)
+	c.dialMu.Lock()
+	c.dialCancel = cancel
+	c.dialMu.Unlock()
+	conn, err := dial(dialCtx, "tcp", address, timeout)
+	c.dialMu.Lock()
+	c.dialCancel = nil
+	c.dialMu.Unlock()
+	cancel()
 	if err != nil {
 		c.startMu.Unlock()
 		_, _, _, onError := c.callbacks()
@@ -119,7 +145,11 @@ func (c *TcpClient) Start() error {
 		_ = old.Close()
 	}
 	onConnect, _, _, _ := c.callbacks()
-	go c.handleConn(conn)
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		c.handleConn(conn)
+	}()
 	c.startMu.Unlock()
 	if onConnect != nil {
 		onConnect(conn)
@@ -155,6 +185,12 @@ func (c *TcpClient) handleConn(conn net.Conn) {
 
 // Stop closes the current connection. It is safe to call repeatedly.
 func (c *TcpClient) Stop() error {
+	c.dialMu.Lock()
+	cancel := c.dialCancel
+	c.dialMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 	c.startMu.Lock()
 	defer c.startMu.Unlock()
 	conn := c.replaceConn(nil)
@@ -164,8 +200,22 @@ func (c *TcpClient) Stop() error {
 	return conn.Close()
 }
 
+// Shutdown stops the client and waits for its read goroutine to exit.
+func (c *TcpClient) Shutdown(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	err := c.Stop()
+	if waitErr := waitGroupContext(ctx, &c.wg); waitErr != nil {
+		return waitErr
+	}
+	return err
+}
+
 // Write sends all bytes or returns an error.
 func (c *TcpClient) Write(data []byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
 	conn := c.getConn()
 	if conn == nil {
 		return errors.New("tcp client not connected")

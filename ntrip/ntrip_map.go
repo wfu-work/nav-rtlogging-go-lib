@@ -19,6 +19,7 @@ const (
 	defaultNtripWriteTimeout      = 1 * time.Second
 	defaultNtripKeepAlivePeriod   = 2 * time.Minute
 	defaultNtripMaxHeaderSize     = 8192
+	defaultNtripMaxConnections    = 1024
 )
 
 type NtripChannelBean struct {
@@ -76,7 +77,7 @@ func (c *NtripChannelBean) writer() {
 					attempt = 0
 					continue
 				}
-				if nerr, ok := err.(net.Error); ok && (nerr.Timeout() || nerr.Temporary()) && attempt < 3 {
+				if nerr, ok := err.(net.Error); ok && nerr.Timeout() && attempt < 3 {
 					attempt++
 					logPrintf("⚠️retry #%d write timeout to %s...\n", attempt, c.mount)
 					time.Sleep(100 * time.Millisecond)
@@ -119,10 +120,15 @@ func (c *NtripChannelBean) Send(data []byte) {
 
 // SendLoss 发送数据，队列满时丢弃旧数据，保留最新实时数据。
 func (c *NtripChannelBean) SendLoss(data []byte) {
-	if atomic.LoadUint32(&c.closed) == 1 {
+	c.sendLossOwned(cloneBytes(data))
+}
+
+// sendLossOwned queues immutable data without copying it. The caller must not
+// mutate data after this call; it may be shared by multiple subscribers.
+func (c *NtripChannelBean) sendLossOwned(data []byte) {
+	if len(data) == 0 || atomic.LoadUint32(&c.closed) == 1 {
 		return
 	}
-	data = cloneBytes(data)
 	select {
 	case c.send <- data:
 	default:
@@ -202,6 +208,7 @@ func (s *SafeNtripMap) Get(key string) *NtripChannelBean {
 func (s *SafeNtripMap) Set(key string, val *NtripChannelBean) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.ensureInitializedLocked()
 	if old := s.data[key]; old != nil {
 		s.deleteMountIndexLocked(key, old.mount)
 	}
@@ -214,6 +221,35 @@ func (s *SafeNtripMap) Set(key string, val *NtripChannelBean) {
 		s.byMount[val.mount] = make(map[string]*NtripChannelBean)
 	}
 	s.byMount[val.mount][key] = val
+}
+
+// SetIfMountAbsent stores val only when no other entry owns the same mount.
+// It atomically enforces the single-source-per-mount invariant.
+func (s *SafeNtripMap) SetIfMountAbsent(key string, val *NtripChannelBean) bool {
+	if val == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ensureInitializedLocked()
+	if existing := s.byMount[val.mount]; len(existing) > 0 {
+		return false
+	}
+	if old := s.data[key]; old != nil {
+		s.deleteMountIndexLocked(key, old.mount)
+	}
+	s.data[key] = val
+	s.byMount[val.mount] = map[string]*NtripChannelBean{key: val}
+	return true
+}
+
+func (s *SafeNtripMap) ensureInitializedLocked() {
+	if s.data == nil {
+		s.data = make(map[string]*NtripChannelBean)
+	}
+	if s.byMount == nil {
+		s.byMount = make(map[string]map[string]*NtripChannelBean)
+	}
 }
 
 func (s *SafeNtripMap) Delete(key string) *NtripChannelBean {
@@ -241,11 +277,18 @@ func (s *SafeNtripMap) deleteMountIndexLocked(key string, mount string) {
 func (s *SafeNtripMap) GetByMount(mount string) []*NtripChannelBean {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	var result []*NtripChannelBean
+	result := make([]*NtripChannelBean, 0, len(s.byMount[mount]))
 	for _, bean := range s.byMount[mount] {
 		result = append(result, bean)
 	}
 	return result
+}
+
+// HasMount reports whether at least one connection currently owns mount.
+func (s *SafeNtripMap) HasMount(mount string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.byMount[mount]) > 0
 }
 
 func (s *SafeNtripMap) ForEachByMount(mount string, f func(*NtripChannelBean)) {
@@ -260,17 +303,31 @@ func (s *SafeNtripMap) ForEachByMount(mount string, f func(*NtripChannelBean)) {
 	}
 }
 
+// BroadcastLossByMount sends one shared immutable payload to all subscribers
+// on mount. It avoids one payload allocation and one slice allocation per
+// subscriber while preserving the real-time drop-oldest policy.
+func (s *SafeNtripMap) BroadcastLossByMount(mount string, data []byte) int {
+	if len(data) == 0 {
+		return 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	count := 0
+	for _, bean := range s.byMount[mount] {
+		if bean == nil || bean.conn == nil {
+			continue
+		}
+		bean.sendLossOwned(data)
+		count++
+	}
+	return count
+}
+
 func (s *SafeNtripMap) GetMountList() []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	unique := make(map[string]struct{}, len(s.byMount))
-	for _, bean := range s.data {
-		if bean != nil {
-			unique[bean.mount] = struct{}{}
-		}
-	}
-	result := make([]string, 0, len(unique))
-	for mount := range unique {
+	result := make([]string, 0, len(s.byMount))
+	for mount := range s.byMount {
 		result = append(result, mount)
 	}
 	sort.Strings(result)
@@ -280,15 +337,11 @@ func (s *SafeNtripMap) GetMountList() []string {
 func (s *SafeNtripMap) QueryMountList(mount string) []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	unique := make(map[string]struct{})
-	for _, bean := range s.data {
-		if bean != nil && strings.Contains(bean.mount, mount) {
-			unique[bean.mount] = struct{}{}
+	result := make([]string, 0, len(s.byMount))
+	for candidate := range s.byMount {
+		if strings.Contains(candidate, mount) {
+			result = append(result, candidate)
 		}
-	}
-	result := make([]string, 0, len(unique))
-	for candidate := range unique {
-		result = append(result, candidate)
 	}
 	sort.Strings(result)
 	return result

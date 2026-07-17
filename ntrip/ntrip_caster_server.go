@@ -1,6 +1,8 @@
 package ntrip
 
 import (
+	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -10,24 +12,30 @@ import (
 
 // NtripCasterServer accepts NTRIP source connections.
 type NtripCasterServer struct {
-	addr              string
-	ln                net.Listener
-	listen            func(network, address string) (net.Listener, error)
-	ntripMap          *SafeNtripMap
-	ntripCasterClient *NtripCasterClient
-	onConnect         OnConnectFunc
-	disConnect        OnDisConnectFunc
-	onData            OnDataFunc
-	onSize            OnSizeFunc
-	onAuth            OnAuthFunc
-	onSpeed           OnSpeedFunc
-	onNetError        OnNetErrorFunc
-	done              chan struct{}
-	conns             map[net.Conn]struct{}
-	mu                sync.RWMutex
-	callbackMu        sync.RWMutex
-	statsMu           sync.Mutex
-	bytesByMount      map[string]int64
+	addr                string
+	ln                  net.Listener
+	listen              func(network, address string) (net.Listener, error)
+	ntripMap            *SafeNtripMap
+	ntripCasterClient   *NtripCasterClient
+	onConnect           OnConnectFunc
+	disConnect          OnDisConnectFunc
+	onData              OnDataFunc
+	onSize              OnSizeFunc
+	onAuth              OnAuthFunc
+	onSpeed             OnSpeedFunc
+	onNetError          OnNetErrorFunc
+	done                chan struct{}
+	conns               map[net.Conn]string
+	connectionsByIP     map[string]int
+	mu                  sync.RWMutex
+	callbackMu          sync.RWMutex
+	statsMu             sync.Mutex
+	bytesByMount        map[string]int64
+	tlsConfig           *tls.Config
+	maxConnections      int
+	maxConnectionsPerIP int
+	requireAuth         bool
+	wg                  sync.WaitGroup
 }
 
 // NewNtripCasterServer creates the source-facing side of an embedded caster.
@@ -38,13 +46,65 @@ func NewNtripCasterServer(port int) *NtripCasterServer {
 // NewNtripCasterServerOnAddress creates a source listener bound to host.
 func NewNtripCasterServerOnAddress(host string, port int) *NtripCasterServer {
 	return &NtripCasterServer{
-		addr:         net.JoinHostPort(host, fmt.Sprintf("%d", port)),
-		listen:       net.Listen,
-		ntripMap:     NewSafeNtripMap(),
-		done:         make(chan struct{}),
-		conns:        make(map[net.Conn]struct{}),
-		bytesByMount: make(map[string]int64),
+		addr:            net.JoinHostPort(host, fmt.Sprintf("%d", port)),
+		listen:          net.Listen,
+		ntripMap:        NewSafeNtripMap(),
+		done:            make(chan struct{}),
+		conns:           make(map[net.Conn]string),
+		connectionsByIP: make(map[string]int),
+		bytesByMount:    make(map[string]int64),
+		maxConnections:  defaultNtripMaxConnections,
+		requireAuth:     !isLoopbackBindAddress(host),
 	}
+}
+
+// SetMaxConnectionsPerIP sets the maximum number of source connections from
+// one remote IP address. A value of zero disables the per-IP limit.
+func (s *NtripCasterServer) SetMaxConnectionsPerIP(limit int) error {
+	if limit < 0 {
+		return errors.New("ntrip caster source max connections per IP cannot be negative")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ln != nil {
+		return errors.New("cannot change ntrip caster source max connections per IP while running")
+	}
+	s.maxConnectionsPerIP = limit
+	return nil
+}
+
+// SetTLSConfig enables TLS for incoming source connections. It must be called
+// before Start. A nil config keeps the listener on plain TCP.
+func (s *NtripCasterServer) SetTLSConfig(config *tls.Config) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ln != nil {
+		return errors.New("cannot change ntrip caster source TLS config while running")
+	}
+	if config == nil {
+		s.tlsConfig = nil
+		return nil
+	}
+	if len(config.Certificates) == 0 && config.GetCertificate == nil && config.GetConfigForClient == nil {
+		return errors.New("ntrip caster source TLS config requires a server certificate")
+	}
+	s.tlsConfig = config.Clone()
+	return nil
+}
+
+// SetMaxConnections sets the maximum number of pending and authenticated
+// source connections. A value of zero disables the limit.
+func (s *NtripCasterServer) SetMaxConnections(limit int) error {
+	if limit < 0 {
+		return errors.New("ntrip caster source max connections cannot be negative")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ln != nil {
+		return errors.New("cannot change ntrip caster source max connections while running")
+	}
+	s.maxConnections = limit
+	return nil
 }
 
 func (s *NtripCasterServer) OnConnect(f OnConnectFunc) {
@@ -103,8 +163,15 @@ func (s *NtripCasterServer) speedCallback() OnSpeedFunc {
 
 func (s *NtripCasterServer) SetNtripCasterClient(client *NtripCasterClient) {
 	s.mu.Lock()
+	previous := s.ntripCasterClient
 	s.ntripCasterClient = client
 	s.mu.Unlock()
+	if previous != nil && previous != client {
+		previous.clearCasterServer(s)
+	}
+	if client != nil {
+		client.setCasterServer(s)
+	}
 }
 
 func (s *NtripCasterServer) casterClient() *NtripCasterClient {
@@ -129,10 +196,15 @@ func (s *NtripCasterServer) Addr() net.Addr {
 
 // Start starts accepting source connections. A stopped server may be started again.
 func (s *NtripCasterServer) Start() error {
+	_, _, _, _, onAuth, _ := s.callbacks()
 	s.mu.Lock()
 	if s.ln != nil {
 		s.mu.Unlock()
 		return errors.New("ntrip caster source listener already started")
+	}
+	if s.requireAuth && onAuth == nil {
+		s.mu.Unlock()
+		return errors.New("external ntrip caster source listener requires an authentication callback")
 	}
 	listen := s.listen
 	if listen == nil {
@@ -147,16 +219,26 @@ func (s *NtripCasterServer) Start() error {
 		}
 		return err
 	}
+	if s.tlsConfig != nil {
+		ln = tls.NewListener(ln, s.tlsConfig.Clone())
+	}
 	if s.done == nil || isClosed(s.done) {
 		s.done = make(chan struct{})
 	}
 	s.ln = ln
 	done := s.done
+	s.wg.Add(2)
 	s.mu.Unlock()
 	logPrintln("✅ntrip caster server listening on", ln.Addr())
 
-	go s.acceptLoop(ln, done)
-	go s.speedLoop(done)
+	go func() {
+		defer s.wg.Done()
+		s.acceptLoop(ln, done)
+	}()
+	go func() {
+		defer s.wg.Done()
+		s.speedLoop(done)
+	}()
 	return nil
 }
 
@@ -196,9 +278,29 @@ func (s *NtripCasterServer) acceptLoop(ln net.Listener, done <-chan struct{}) {
 			_ = conn.Close()
 			continue
 		}
-		s.conns[conn] = struct{}{}
+		if s.maxConnections > 0 && len(s.conns) >= s.maxConnections {
+			s.mu.Unlock()
+			writeNtripRejection(conn, "HTTP/1.0 503 Service Unavailable\r\nConnection: close\r\n\r\n")
+			_ = conn.Close()
+			continue
+		}
+		ip := remoteIP(conn.RemoteAddr())
+		if s.maxConnectionsPerIP > 0 && s.connectionsByIP[ip] >= s.maxConnectionsPerIP {
+			s.mu.Unlock()
+			writeNtripRejection(conn, "HTTP/1.0 429 Too Many Requests\r\nConnection: close\r\n\r\n")
+			_ = conn.Close()
+			continue
+		}
+		s.conns[conn] = ip
+		s.connectionsByIP[ip]++
+		// Add while holding mu so Shutdown cannot begin waiting before this
+		// accepted connection has been registered with the WaitGroup.
+		s.wg.Add(1)
 		s.mu.Unlock()
-		go s.handleConn(conn)
+		go func(conn net.Conn) {
+			defer s.wg.Done()
+			s.handleConn(conn)
+		}(conn)
 	}
 }
 
@@ -214,7 +316,8 @@ func (s *NtripCasterServer) Stop() error {
 	for conn := range s.conns {
 		conns = append(conns, conn)
 	}
-	s.conns = make(map[net.Conn]struct{})
+	s.conns = make(map[net.Conn]string)
+	s.connectionsByIP = make(map[string]int)
 	s.mu.Unlock()
 
 	s.ntripMap.CloseAll()
@@ -231,13 +334,33 @@ func (s *NtripCasterServer) Stop() error {
 	return err
 }
 
+// Shutdown stops the source listener and waits for all accepted connections
+// and background goroutines to exit.
+func (s *NtripCasterServer) Shutdown(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	err := s.Stop()
+	if waitErr := waitGroupContext(ctx, &s.wg); waitErr != nil {
+		return waitErr
+	}
+	return err
+}
+
 func (s *NtripCasterServer) handleConn(conn net.Conn) {
 	enableTCPKeepAlive(conn)
 	key := conn.RemoteAddr().String()
 	var bean *NtripChannelBean
 	defer func() {
 		s.mu.Lock()
-		delete(s.conns, conn)
+		if ip, ok := s.conns[conn]; ok {
+			delete(s.conns, conn)
+			if s.connectionsByIP[ip] <= 1 {
+				delete(s.connectionsByIP, ip)
+			} else {
+				s.connectionsByIP[ip]--
+			}
+		}
 		s.mu.Unlock()
 		removed := s.ntripMap.Delete(key)
 		if removed != nil {
@@ -279,12 +402,11 @@ func (s *NtripCasterServer) handleConn(conn net.Conn) {
 				}
 				continue
 			}
-			bean = s.auth(conn, authBuf[:headerEnd])
+			bean = s.auth(conn, authBuf[:headerEnd], key)
 			if bean == nil {
 				return
 			}
 			setReadDeadline(conn, defaultNtripSourceIdleTimeout)
-			s.ntripMap.Set(key, bean)
 			onConnect, _, _, _, _, _ := s.callbacks()
 			if onConnect != nil {
 				onConnect(key, bean.mount, conn)
@@ -304,11 +426,7 @@ func (s *NtripCasterServer) processSourceData(key string, bean *NtripChannelBean
 		return
 	}
 	if client := s.casterClient(); client != nil {
-		client.ntripMap.ForEachByMount(bean.mount, func(subscriber *NtripChannelBean) {
-			if subscriber != nil && subscriber.conn != nil {
-				subscriber.SendLoss(data)
-			}
-		})
+		client.ntripMap.BroadcastLossByMount(bean.mount, cloneBytes(data))
 	}
 	s.statsMu.Lock()
 	s.bytesByMount[bean.mount] += int64(len(data))
@@ -358,10 +476,14 @@ func (s *NtripCasterServer) takeMountSpeeds(interval time.Duration) map[string]i
 	return speeds
 }
 
-func (s *NtripCasterServer) auth(conn net.Conn, data []byte) *NtripChannelBean {
+func (s *NtripCasterServer) auth(conn net.Conn, data []byte, key string) *NtripChannelBean {
 	request, err := parseNtripRequest(data)
 	if err != nil || (request.method != "SOURCE" && request.method != "POST") {
 		_ = WriteData(conn, []byte(ntripAuthResponse(false)))
+		return nil
+	}
+	if err := validateMount(request.target); err != nil {
+		_ = WriteData(conn, []byte(ntripAuthResponseForRequest(false, request)))
 		return nil
 	}
 
@@ -379,14 +501,26 @@ func (s *NtripCasterServer) auth(conn net.Conn, data []byte) *NtripChannelBean {
 		}
 	}
 	_, _, _, _, onAuth, _ := s.callbacks()
-	authorized := mount == password
+	authorized := false
 	if onAuth != nil {
 		authorized = onAuth(mount, username, password)
+	} else if !s.requireAuth {
+		authorized = mount == password
 	}
-	if err := WriteData(conn, []byte(ntripAuthResponseForRequest(authorized, request))); err != nil || !authorized {
+	if !authorized {
+		_ = WriteData(conn, []byte(ntripAuthResponseForRequest(false, request)))
 		return nil
 	}
-	return &NtripChannelBean{mount: mount, conn: conn}
+	bean := &NtripChannelBean{mount: mount, conn: conn}
+	if !s.ntripMap.SetIfMountAbsent(key, bean) {
+		_ = WriteData(conn, []byte(ntripConflictResponseForRequest(request)))
+		return nil
+	}
+	if err := WriteData(conn, []byte(ntripAuthResponseForRequest(true, request))); err != nil {
+		s.ntripMap.Delete(key)
+		return nil
+	}
+	return bean
 }
 
 func (s *NtripCasterServer) authNtripServer1(data string) (string, string, bool) {
@@ -402,11 +536,16 @@ func (s *NtripCasterServer) authLegacySource(data string) (string, string, bool)
 	if err != nil || request.method != "SOURCE" {
 		return "", "", false
 	}
+	if err := validateMount(request.target); err != nil {
+		return request.target, "", false
+	}
 	password := request.parts[1]
 	_, _, _, _, onAuth, _ := s.callbacks()
-	authorized := request.target == password
+	authorized := false
 	if onAuth != nil {
 		authorized = onAuth(request.target, "", password)
+	} else if !s.requireAuth {
+		authorized = request.target == password
 	}
 	return request.target, password, authorized
 }
@@ -416,14 +555,19 @@ func (s *NtripCasterServer) authNtripServer3(data string) (string, string, bool)
 	if err != nil || request.method != "POST" {
 		return "", "", false
 	}
+	if err := validateMount(request.target); err != nil {
+		return request.target, "", false
+	}
 	username, password, err := parseBasicAuthorization(request.headers["authorization"])
 	if err != nil {
 		return request.target, "", false
 	}
 	_, _, _, _, onAuth, _ := s.callbacks()
-	authorized := request.target == password
+	authorized := false
 	if onAuth != nil {
 		authorized = onAuth(request.target, username, password)
+	} else if !s.requireAuth {
+		authorized = request.target == password
 	}
 	return request.target, password, authorized
 }

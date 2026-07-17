@@ -1,6 +1,7 @@
 package ntrip
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"errors"
@@ -11,7 +12,8 @@ import (
 	"time"
 )
 
-// NtripServer represents an NTRIP source connection.
+// NtripServer represents an NTRIP source connection. Configure exported fields
+// before Start or Connect; use Shutdown before changing them for a reconnect.
 type NtripServer struct {
 	Host           string
 	Port           int
@@ -21,7 +23,7 @@ type NtripServer struct {
 	DialTimeout    time.Duration
 	TLSConfig      *tls.Config
 	UseNtripV2     bool
-	dial           func(string, int, time.Duration, *tls.Config) (net.Conn, error)
+	dial           func(context.Context, string, int, time.Duration, *tls.Config) (net.Conn, error)
 	Conn           net.Conn // Deprecated: use Connection or Write instead.
 	onConnect      OnConnectFunc
 	onDisConnect   OnDisConnectFunc
@@ -30,6 +32,10 @@ type NtripServer struct {
 	connMu         sync.RWMutex
 	startMu        sync.Mutex
 	callbackMu     sync.RWMutex
+	writeMu        sync.Mutex
+	dialMu         sync.Mutex
+	dialCancel     context.CancelFunc
+	wg             sync.WaitGroup
 }
 
 // NewNtripServer creates a new NTRIP source connection.
@@ -116,11 +122,40 @@ func (s *NtripServer) Connection() net.Conn {
 // Successful return means the TCP connection and authentication request were
 // established; OnConnect reports completion of NTRIP authentication.
 func (s *NtripServer) Start() error {
+	_, _, err := s.startConnectionContext(context.Background())
+	return err
+}
+
+// Connect establishes the source connection and waits for NTRIP
+// authentication to complete.
+func (s *NtripServer) Connect(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	authResult, conn, err := s.startConnectionContext(ctx)
+	if err != nil {
+		return err
+	}
+	select {
+	case err := <-authResult:
+		return err
+	case <-ctx.Done():
+		if s.clearConnIfCurrent(conn) {
+			_ = conn.Close()
+		}
+		return ctx.Err()
+	}
+}
+
+func (s *NtripServer) startConnectionContext(parent context.Context) (<-chan error, net.Conn, error) {
 	s.startMu.Lock()
-	if err := validateMount(s.Mount); err != nil {
+	mount := s.Mount
+	username := s.Username
+	password := s.Password
+	if err := validateMount(mount); err != nil {
 		s.startMu.Unlock()
 		s.notifyNetError(err)
-		return err
+		return nil, nil, err
 	}
 
 	address := ntripAddress(s.Host, s.Port)
@@ -128,21 +163,29 @@ func (s *NtripServer) Start() error {
 	if dial == nil {
 		dial = dialNtrip
 	}
-	conn, err := dial(s.Host, s.Port, s.DialTimeout, s.TLSConfig)
+	dialCtx, cancel := context.WithCancel(parent)
+	s.dialMu.Lock()
+	s.dialCancel = cancel
+	s.dialMu.Unlock()
+	conn, err := dial(dialCtx, s.Host, s.Port, s.DialTimeout, s.TLSConfig)
+	s.dialMu.Lock()
+	s.dialCancel = nil
+	s.dialMu.Unlock()
+	cancel()
 	if err != nil {
 		err = fmt.Errorf("dial ntrip caster %s: %w", address, err)
 		s.startMu.Unlock()
 		s.notifyNetError(err)
-		return err
+		return nil, nil, err
 	}
 	enableTCPKeepAlive(conn)
 	if old := s.replaceConn(conn); old != nil && old != conn {
 		_ = old.Close()
 	}
 
-	authMessage := createNtripServerAuthMsg(s.Mount, s.Password)
+	authMessage := createNtripServerAuthMsg(mount, password)
 	if s.UseNtripV2 {
-		authMessage = createNtripServerV2AuthMsg(s.Mount, s.Username, s.Password, address)
+		authMessage = createNtripServerV2AuthMsg(mount, username, password, address)
 	}
 	if err := WriteData(conn, []byte(authMessage)); err != nil {
 		s.clearConnIfCurrent(conn)
@@ -150,16 +193,27 @@ func (s *NtripServer) Start() error {
 		err = fmt.Errorf("send ntrip source authentication: %w", err)
 		s.startMu.Unlock()
 		s.notifyNetError(err)
-		return err
+		return nil, nil, err
 	}
 	setReadDeadline(conn, defaultNtripAuthTimeout)
-	go s.handleConn(conn)
+	authResult := make(chan error, 1)
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.handleConnWithAuth(conn, authResult, mount)
+	}()
 	s.startMu.Unlock()
-	return nil
+	return authResult, conn, nil
 }
 
 // Stop closes the current source connection. It is safe to call repeatedly.
 func (s *NtripServer) Stop() error {
+	s.dialMu.Lock()
+	cancel := s.dialCancel
+	s.dialMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 	s.startMu.Lock()
 	defer s.startMu.Unlock()
 	conn := s.replaceConn(nil)
@@ -169,14 +223,39 @@ func (s *NtripServer) Stop() error {
 	return conn.Close()
 }
 
+// Shutdown stops the source connection and waits for its read goroutine.
+func (s *NtripServer) Shutdown(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	err := s.Stop()
+	if waitErr := waitGroupContext(ctx, &s.wg); waitErr != nil {
+		return waitErr
+	}
+	return err
+}
+
 // Write sends source payload on the current connection.
 func (s *NtripServer) Write(data []byte) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	return WriteData(s.Connection(), data)
 }
 
 func (s *NtripServer) handleConn(conn net.Conn) {
+	s.handleConnWithAuth(conn, nil, s.Mount)
+}
+
+func (s *NtripServer) handleConnWithAuth(conn net.Conn, authResult chan<- error, mount string) {
 	connected := false
 	var disconnectOnce sync.Once
+	var authOnce sync.Once
+	reportAuth := func(err error) {
+		if authResult != nil {
+			authOnce.Do(func() { authResult <- err })
+		}
+	}
+	defer reportAuth(ErrNtripAuthenticationInterrupted)
 	defer func() {
 		wasCurrent := s.clearConnIfCurrent(conn)
 		_ = conn.Close()
@@ -184,7 +263,7 @@ func (s *NtripServer) handleConn(conn net.Conn) {
 			_, callback, _, _ := s.connectionCallbacks()
 			disconnectOnce.Do(func() {
 				if callback != nil {
-					callback(conn.LocalAddr().String(), s.Mount)
+					callback(conn.LocalAddr().String(), mount)
 				}
 			})
 		}
@@ -195,7 +274,11 @@ func (s *NtripServer) handleConn(conn net.Conn) {
 	for {
 		n, err := conn.Read(buf)
 		if err != nil {
-			if !errors.Is(err, net.ErrClosed) && err != io.EOF {
+			if !connected && !errors.Is(err, net.ErrClosed) {
+				authErr := fmt.Errorf("read ntrip source authentication response: %w", err)
+				reportAuth(authErr)
+				s.notifyNetError(authErr)
+			} else if connected && !errors.Is(err, net.ErrClosed) && err != io.EOF {
 				s.notifyNetError(fmt.Errorf("read ntrip source connection: %w", err))
 			}
 			return
@@ -206,27 +289,33 @@ func (s *NtripServer) handleConn(conn net.Conn) {
 			headerEnd := findNtripResponseHeaderEnd(responseBuf)
 			if headerEnd < 0 {
 				if len(responseBuf) > defaultNtripMaxHeaderSize {
-					s.notifyNetError(fmt.Errorf("ntrip source authentication response exceeds %d bytes", defaultNtripMaxHeaderSize))
+					authErr := fmt.Errorf("ntrip source authentication response exceeds %d bytes", defaultNtripMaxHeaderSize)
+					reportAuth(authErr)
+					s.notifyNetError(authErr)
 					return
 				}
 				continue
 			}
 			header := responseBuf[:headerEnd]
 			if !isNtripSuccessHeader(header) {
-				s.notifyNetError(fmt.Errorf("ntrip source authentication failed: %q", firstLine(header)))
+				authErr := fmt.Errorf("ntrip source authentication failed: %q", firstLine(header))
+				reportAuth(authErr)
+				s.notifyNetError(authErr)
 				return
 			}
 			if s.Connection() != conn {
+				reportAuth(ErrNtripAuthenticationInterrupted)
 				return
 			}
 			connected = true
+			reportAuth(nil)
 			setReadDeadline(conn, 0)
 			onConnect, _, onData, _ := s.connectionCallbacks()
 			if onConnect != nil {
-				onConnect(conn.LocalAddr().String(), s.Mount, conn)
+				onConnect(conn.LocalAddr().String(), mount, conn)
 			}
 			if payload := responseBuf[headerEnd:]; len(payload) > 0 && onData != nil {
-				onData(conn.LocalAddr().String(), s.Mount, cloneBytes(payload), "")
+				onData(conn.LocalAddr().String(), mount, cloneBytes(payload), "")
 			}
 			responseBuf = nil
 			continue
@@ -234,7 +323,7 @@ func (s *NtripServer) handleConn(conn net.Conn) {
 
 		_, _, onData, _ := s.connectionCallbacks()
 		if onData != nil {
-			onData(conn.LocalAddr().String(), s.Mount, cloneBytes(data), "")
+			onData(conn.LocalAddr().String(), mount, cloneBytes(data), "")
 		}
 	}
 }

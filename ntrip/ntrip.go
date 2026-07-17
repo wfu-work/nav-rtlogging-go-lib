@@ -1,6 +1,7 @@
 package ntrip
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 type OnConnectFunc func(key string, mount string, conn net.Conn)
@@ -64,14 +66,25 @@ func logPrintf(format string, v ...any) {
 
 // NtripCasterConfig configures both sides of the embedded caster.
 // Externally reachable bind addresses require explicit authentication callbacks.
+// Zero total connection limits use the default of 1024 connections per side;
+// zero per-IP limits disable per-IP limiting.
 type NtripCasterConfig struct {
-	BindAddress string
-	SourcePort  int
-	ClientPort  int
-	SourceAuth  OnAuthFunc
-	ClientAuth  OnAuthFunc
+	BindAddress               string
+	SourcePort                int
+	ClientPort                int
+	SourceAuth                OnAuthFunc
+	ClientAuth                OnAuthFunc
+	SourceTLSConfig           *tls.Config
+	ClientTLSConfig           *tls.Config
+	MaxSourceConnections      int
+	MaxClientConnections      int
+	MaxSourceConnectionsPerIP int
+	MaxClientConnectionsPerIP int
+	RequireActiveSource       bool
+	RequireSourcetableAuth    bool
 }
 
+// InitNtripCaster starts a loopback-only caster with development credentials.
 func InitNtripCaster(ntripCasterServerPort int, ntripCasterClientPort int) (*NtripCasterServer, *NtripCasterClient) {
 	server, client, err := InitNtripCasterWithError(ntripCasterServerPort, ntripCasterClientPort)
 	if err != nil {
@@ -100,6 +113,10 @@ func InitNtripCasterWithAddress(bindAddress string, ntripCasterServerPort int, n
 // InitNtripCasterWithConfig initializes both caster listeners. Explicit source
 // and client authentication callbacks are mandatory for non-loopback binds.
 func InitNtripCasterWithConfig(config NtripCasterConfig) (*NtripCasterServer, *NtripCasterClient, error) {
+	if config.MaxSourceConnections < 0 || config.MaxClientConnections < 0 ||
+		config.MaxSourceConnectionsPerIP < 0 || config.MaxClientConnectionsPerIP < 0 {
+		return nil, nil, errors.New("ntrip caster connection limits cannot be negative")
+	}
 	loopback := isLoopbackBindAddress(config.BindAddress)
 	if !loopback && (config.SourceAuth == nil || config.ClientAuth == nil) {
 		return nil, nil, errors.New("external ntrip caster listeners require explicit source and client authentication callbacks")
@@ -115,11 +132,20 @@ func InitNtripCasterWithConfig(config NtripCasterConfig) (*NtripCasterServer, *N
 		}
 	}
 
-	casterInitMu.Lock()
-	defer casterInitMu.Unlock()
-	stopNtripCaster()
-
 	server := NewNtripCasterServerOnAddress(config.BindAddress, config.SourcePort)
+	if err := server.SetTLSConfig(config.SourceTLSConfig); err != nil {
+		return nil, nil, err
+	}
+	if config.MaxSourceConnections > 0 {
+		if err := server.SetMaxConnections(config.MaxSourceConnections); err != nil {
+			return nil, nil, err
+		}
+	}
+	if config.MaxSourceConnectionsPerIP > 0 {
+		if err := server.SetMaxConnectionsPerIP(config.MaxSourceConnectionsPerIP); err != nil {
+			return nil, nil, err
+		}
+	}
 	server.OnConnect(func(key string, mount string, conn net.Conn) {
 		logPrintln("✅ntrip caster server online: ", key, mount)
 	})
@@ -132,6 +158,21 @@ func InitNtripCasterWithConfig(config NtripCasterConfig) (*NtripCasterServer, *N
 	})
 
 	client := NewNtripCasterClientOnAddress(config.BindAddress, config.ClientPort)
+	if err := client.SetTLSConfig(config.ClientTLSConfig); err != nil {
+		return nil, nil, err
+	}
+	if config.MaxClientConnections > 0 {
+		if err := client.SetMaxConnections(config.MaxClientConnections); err != nil {
+			return nil, nil, err
+		}
+	}
+	if config.MaxClientConnectionsPerIP > 0 {
+		if err := client.SetMaxConnectionsPerIP(config.MaxClientConnectionsPerIP); err != nil {
+			return nil, nil, err
+		}
+	}
+	client.SetRequireActiveSource(config.RequireActiveSource)
+	client.SetRequireSourcetableAuth(config.RequireSourcetableAuth)
 	client.OnConnect(func(key string, mount string, conn net.Conn) {
 		logPrintln("✅ntrip caster client online: ", key, mount)
 	})
@@ -143,6 +184,10 @@ func InitNtripCasterWithConfig(config NtripCasterConfig) (*NtripCasterServer, *N
 		return clientAuth(mount, username, password)
 	})
 	server.SetNtripCasterClient(client)
+
+	casterInitMu.Lock()
+	defer casterInitMu.Unlock()
+	stopNtripCaster()
 
 	if err := server.Start(); err != nil {
 		return server, client, fmt.Errorf("start ntrip caster source listener: %w", err)
@@ -210,20 +255,21 @@ func enableTCPKeepAlive(conn net.Conn) {
 	_ = tcpConn.SetKeepAlivePeriod(defaultNtripKeepAlivePeriod)
 }
 
-func dialNtrip(host string, port int, timeout time.Duration, tlsConfig *tls.Config) (net.Conn, error) {
+func dialNtrip(ctx context.Context, host string, port int, timeout time.Duration, tlsConfig *tls.Config) (net.Conn, error) {
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
 	address := ntripAddress(host, port)
 	dialer := &net.Dialer{Timeout: timeout}
 	if tlsConfig == nil {
-		return dialer.Dial("tcp", address)
+		return dialer.DialContext(ctx, "tcp", address)
 	}
 	config := tlsConfig.Clone()
 	if config.ServerName == "" {
 		config.ServerName = host
 	}
-	return tls.DialWithDialer(dialer, "tcp", address, config)
+	tlsDialer := &tls.Dialer{NetDialer: dialer, Config: config}
+	return tlsDialer.DialContext(ctx, "tcp", address)
 }
 
 func ntripAddress(host string, port int) string {
@@ -234,10 +280,53 @@ func validateMount(mount string) error {
 	if strings.TrimSpace(mount) == "" {
 		return errors.New("ntrip mount point is empty")
 	}
-	if strings.ContainsAny(mount, "\r\n\t ") {
-		return fmt.Errorf("ntrip mount point contains invalid whitespace: %q", mount)
+	if strings.ContainsRune(mount, ';') || strings.IndexFunc(mount, func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsControl(r)
+	}) >= 0 {
+		return fmt.Errorf("ntrip mount point contains an invalid character: %q", mount)
 	}
 	return nil
+}
+
+func remoteIP(addr net.Addr) string {
+	if addr == nil {
+		return "unknown"
+	}
+	if tcpAddr, ok := addr.(*net.TCPAddr); ok {
+		if ip := tcpAddr.IP.String(); ip != "" {
+			return ip
+		}
+	}
+	host, _, err := net.SplitHostPort(addr.String())
+	if err == nil && host != "" {
+		return strings.Trim(host, "[]")
+	}
+	if value := strings.TrimSpace(addr.String()); value != "" {
+		return value
+	}
+	return "unknown"
+}
+
+func writeNtripRejection(conn net.Conn, response string) {
+	if conn == nil {
+		return
+	}
+	_ = conn.SetWriteDeadline(time.Now().Add(defaultNtripWriteTimeout))
+	_ = WriteData(conn, []byte(response))
+}
+
+func waitGroupContext(ctx context.Context, wg *sync.WaitGroup) error {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func setReadDeadline(conn net.Conn, timeout time.Duration) {
@@ -310,16 +399,23 @@ func GenerateGGA(latitude, longitude float64, altitude float64) string {
 // GenerateGGAChecked validates latitude, longitude, and altitude before
 // generating a GGA sentence.
 func GenerateGGAChecked(latitude, longitude float64, altitude float64) (string, error) {
-	if math.IsNaN(latitude) || math.IsInf(latitude, 0) || latitude < -90 || latitude > 90 {
-		return "", fmt.Errorf("latitude must be a finite value in [-90, 90], got %v", latitude)
-	}
-	if math.IsNaN(longitude) || math.IsInf(longitude, 0) || longitude < -180 || longitude > 180 {
-		return "", fmt.Errorf("longitude must be a finite value in [-180, 180], got %v", longitude)
-	}
-	if math.IsNaN(altitude) || math.IsInf(altitude, 0) {
-		return "", fmt.Errorf("altitude must be finite, got %v", altitude)
+	if err := validateGGAInput(latitude, longitude, altitude); err != nil {
+		return "", err
 	}
 	return generateGGA(latitude, longitude, altitude), nil
+}
+
+func validateGGAInput(latitude, longitude, altitude float64) error {
+	if math.IsNaN(latitude) || math.IsInf(latitude, 0) || latitude < -90 || latitude > 90 {
+		return fmt.Errorf("latitude must be a finite value in [-90, 90], got %v", latitude)
+	}
+	if math.IsNaN(longitude) || math.IsInf(longitude, 0) || longitude < -180 || longitude > 180 {
+		return fmt.Errorf("longitude must be a finite value in [-180, 180], got %v", longitude)
+	}
+	if math.IsNaN(altitude) || math.IsInf(altitude, 0) {
+		return fmt.Errorf("altitude must be finite, got %v", altitude)
+	}
+	return nil
 }
 
 func generateGGA(latitude, longitude float64, altitude float64) string {

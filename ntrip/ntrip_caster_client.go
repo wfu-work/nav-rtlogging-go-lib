@@ -39,7 +39,7 @@ type NtripCasterClient struct {
 
 // NewNtripCasterClient creates the subscriber-facing side of an embedded caster.
 func NewNtripCasterClient(port int) *NtripCasterClient {
-	return NewNtripCasterClientOnAddress("127.0.0.1", port)
+	return NewNtripCasterClientOnAddress(DefaultNtripCasterBindAddress, port)
 }
 
 // NewNtripCasterClientOnAddress creates a subscriber listener bound to host.

@@ -64,11 +64,16 @@ func logPrintf(format string, v ...any) {
 	}
 }
 
+// DefaultNtripCasterBindAddress is used when NtripCasterConfig.BindAddress is empty.
+const DefaultNtripCasterBindAddress = "127.0.0.1"
+
 // NtripCasterConfig configures both sides of the embedded caster.
 // Externally reachable bind addresses require explicit authentication callbacks.
 // Zero total connection limits use the default of 1024 connections per side;
 // zero per-IP limits disable per-IP limiting.
 type NtripCasterConfig struct {
+	// BindAddress controls the local address for both listeners. An empty value
+	// uses DefaultNtripCasterBindAddress.
 	BindAddress               string
 	SourcePort                int
 	ClientPort                int
@@ -97,7 +102,10 @@ func InitNtripCaster(ntripCasterServerPort int, ntripCasterClientPort int) (*Ntr
 // reports listener failures. If either listener fails, any partially started
 // listener is stopped before the function returns.
 func InitNtripCasterWithError(ntripCasterServerPort int, ntripCasterClientPort int) (*NtripCasterServer, *NtripCasterClient, error) {
-	return InitNtripCasterWithAddress("127.0.0.1", ntripCasterServerPort, ntripCasterClientPort)
+	return InitNtripCasterWithConfig(NtripCasterConfig{
+		SourcePort: ntripCasterServerPort,
+		ClientPort: ntripCasterClientPort,
+	})
 }
 
 // InitNtripCasterWithAddress initializes both caster listeners on bindAddress.
@@ -113,6 +121,7 @@ func InitNtripCasterWithAddress(bindAddress string, ntripCasterServerPort int, n
 // InitNtripCasterWithConfig initializes both caster listeners. Explicit source
 // and client authentication callbacks are mandatory for non-loopback binds.
 func InitNtripCasterWithConfig(config NtripCasterConfig) (*NtripCasterServer, *NtripCasterClient, error) {
+	config = config.withDefaults()
 	if config.MaxSourceConnections < 0 || config.MaxClientConnections < 0 ||
 		config.MaxSourceConnectionsPerIP < 0 || config.MaxClientConnectionsPerIP < 0 {
 		return nil, nil, errors.New("ntrip caster connection limits cannot be negative")
@@ -202,6 +211,14 @@ func InitNtripCasterWithConfig(config NtripCasterConfig) (*NtripCasterServer, *N
 	ntripCasterClient = client
 	casterMu.Unlock()
 	return server, client, nil
+}
+
+func (config NtripCasterConfig) withDefaults() NtripCasterConfig {
+	config.BindAddress = strings.TrimSpace(config.BindAddress)
+	if config.BindAddress == "" {
+		config.BindAddress = DefaultNtripCasterBindAddress
+	}
+	return config
 }
 
 func isLoopbackBindAddress(address string) bool {

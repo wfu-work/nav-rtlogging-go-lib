@@ -2,6 +2,10 @@ package ntrip
 
 import "net"
 
+// DefaultNTRIPCasterBindAddress is the canonical-initialism alias for the
+// embedded caster's default bind address.
+const DefaultNTRIPCasterBindAddress = DefaultNtripCasterBindAddress
+
 // Canonical initialism aliases. The original Ntrip-prefixed API remains
 // available for backward compatibility.
 type (

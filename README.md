@@ -119,7 +119,7 @@ _ = sourceSide
 _ = clientSide
 ```
 
-内置初始化默认只监听 `127.0.0.1`。对外提供服务时必须在启动前显式提供两端的业务认证：
+`BindAddress` 为空时，内置初始化默认只监听 `127.0.0.1`；需要监听其他地址时可通过该字段配置。对外提供服务时必须在启动前显式提供两端的业务认证：
 
 ```go
 sourceSide, clientSide, err := ntrip.InitNTRIPCasterWithConfig(ntrip.NTRIPCasterConfig{

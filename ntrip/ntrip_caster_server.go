@@ -40,7 +40,7 @@ type NtripCasterServer struct {
 
 // NewNtripCasterServer creates the source-facing side of an embedded caster.
 func NewNtripCasterServer(port int) *NtripCasterServer {
-	return NewNtripCasterServerOnAddress("127.0.0.1", port)
+	return NewNtripCasterServerOnAddress(DefaultNtripCasterBindAddress, port)
 }
 
 // NewNtripCasterServerOnAddress creates a source listener bound to host.

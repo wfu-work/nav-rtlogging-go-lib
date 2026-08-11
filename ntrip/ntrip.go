@@ -210,6 +210,7 @@ func InitNtripCasterWithConfig(config NtripCasterConfig) (*NtripCasterServer, *N
 	ntripCasterServer = server
 	ntripCasterClient = client
 	casterMu.Unlock()
+	logPrintf("✅ntrip caster ready: source listener=%s, client listener=%s", server.Addr(), client.Addr())
 	return server, client, nil
 }
 
